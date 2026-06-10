@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use omniget_core::core::filename;
 use omniget_core::core::media_processor::MediaProcessor;
 use omniget_core::models::media::{DownloadOptions, DownloadResult, MediaInfo, MediaType};
+use omniget_core::models::progress::ProgressUpdate;
 use omniget_core::models::settings::{self, DownloadSettings};
 use crate::platforms::traits::PlatformDownloader;
 
@@ -321,6 +322,8 @@ impl HotmartDownloader {
                                         concurrent_fragments,
                                         false,
                                         &[],
+                                        None,
+                                        false,
                                     ).await {
                                         Ok(result) => {
                                             let _ = bytes_tx.send(result.file_size_bytes);
@@ -393,6 +396,8 @@ impl HotmartDownloader {
                                         concurrent_fragments,
                                         false,
                                         &[],
+                                        None,
+                                        false,
                                     ).await {
                                         Ok(result) => {
                                             let _ = bytes_tx.send(result.file_size_bytes);
@@ -829,7 +834,7 @@ impl PlatformDownloader for HotmartDownloader {
         &self,
         _info: &MediaInfo,
         _opts: &DownloadOptions,
-        _progress: mpsc::Sender<f64>,
+        _progress: mpsc::Sender<ProgressUpdate>,
     ) -> anyhow::Result<DownloadResult> {
         Err(anyhow!("Hotmart downloads use start_course_download, not the generic download trait"))
     }

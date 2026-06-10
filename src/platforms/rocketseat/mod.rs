@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use omniget_core::models::media::{DownloadOptions, DownloadResult, MediaInfo, MediaType, VideoQuality};
+use omniget_core::models::progress::ProgressUpdate;
 use crate::platforms::traits::PlatformDownloader;
 
 pub struct RocketseatDownloader;
@@ -62,7 +63,7 @@ impl PlatformDownloader for RocketseatDownloader {
         &self,
         _info: &MediaInfo,
         _opts: &DownloadOptions,
-        _progress: mpsc::Sender<f64>,
+        _progress: mpsc::Sender<ProgressUpdate>,
     ) -> anyhow::Result<DownloadResult> {
         Err(anyhow!("Use the courses interface to download from Rocketseat"))
     }
