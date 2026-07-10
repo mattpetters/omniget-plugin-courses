@@ -11,10 +11,32 @@ use crate::platforms::udemy::downloader::UdemyDownloader;
 
 #[derive(Clone, Serialize)]
 struct UdemyDownloadCompleteEvent {
+    course_id: u64,
     course_name: String,
     success: bool,
     error: Option<String>,
     drm_skipped: u32,
+}
+
+/// Fetch the complete curriculum for a course using the authenticated Udemy
+/// session and the portal captured with that session.
+///
+/// This command-facing wrapper intentionally delegates to the shared Udemy API
+/// implementation so API callers and the UI download workflow see the same
+/// curriculum shape and pagination behavior.
+pub async fn udemy_get_curriculum(
+    plugin: &crate::CoursesPlugin,
+    course_id: u64,
+) -> Result<UdemyCurriculum, String> {
+    let session = {
+        let guard = plugin.udemy_session.lock().await;
+        guard.as_ref().cloned().ok_or("not_authenticated")?
+    };
+    let portal = session.portal_name.clone();
+
+    api::get_course_curriculum(&session, &portal, course_id)
+        .await
+        .map_err(|e| format!("Failed to fetch Udemy curriculum: {e:#}"))
 }
 
 async fn fetch_curriculum_via_webview(
@@ -231,6 +253,7 @@ pub async fn start_udemy_course_download(
             Ok(()) => {
                 let _ = host.emit_event(
                     "udemy-download-complete", serde_json::to_value(&UdemyDownloadCompleteEvent {
+                        course_id,
                         course_name: course.title,
                         success: true,
                         error: None,
@@ -241,6 +264,7 @@ pub async fn start_udemy_course_download(
                 tracing::error!("[udemy] download error for '{}': {}", course.title, e);
                 let _ = host.emit_event(
                     "udemy-download-complete", serde_json::to_value(&UdemyDownloadCompleteEvent {
+                        course_id,
                         course_name: course.title,
                         success: false,
                         error: Some(e.to_string()),
@@ -264,5 +288,34 @@ pub async fn cancel_udemy_course_download(
         Ok(())
     } else {
         Err("No active download for this course".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_event_serializes_course_id_for_api_correlation() {
+        let value = serde_json::to_value(UdemyDownloadCompleteEvent {
+            course_id: 42,
+            course_name: "Course".to_string(),
+            success: true,
+            error: None,
+            drm_skipped: 0,
+        })
+        .unwrap();
+
+        assert_eq!(value["course_id"], 42);
+        assert_eq!(value["course_name"], "Course");
+    }
+
+    #[test]
+    fn curriculum_command_requires_an_authenticated_session() {
+        let plugin = crate::CoursesPlugin::new();
+        let runtime = plugin.runtime.clone();
+        let result = runtime.block_on(udemy_get_curriculum(&plugin, 42));
+
+        assert_eq!(result.unwrap_err(), "not_authenticated");
     }
 }

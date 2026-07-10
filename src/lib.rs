@@ -364,6 +364,11 @@ impl OmnigetPlugin for CoursesPlugin {
                     let r = commands::udemy_courses::udemy_refresh_courses(&plugin).await?;
                     serde_json::to_value(r).map_err(|e| e.to_string())
                 }
+                "udemy_get_curriculum" => {
+                    let course_id: u64 = get_arg(&args, "courseId")?;
+                    let r = commands::udemy_downloads::udemy_get_curriculum(&plugin, course_id).await?;
+                    serde_json::to_value(r).map_err(|e| e.to_string())
+                }
                 "start_udemy_course_download" => {
                     let course_json: String = get_arg(&args, "courseJson")?;
                     let output_dir: String = get_arg(&args, "outputDir")?;
@@ -492,6 +497,7 @@ impl OmnigetPlugin for CoursesPlugin {
             "udemy_logout".into(),
             "udemy_list_courses".into(),
             "udemy_refresh_courses".into(),
+            "udemy_get_curriculum".into(),
             "start_udemy_course_download".into(),
             "cancel_udemy_course_download".into(),
             "kiwify_login".into(),
@@ -512,6 +518,18 @@ impl OmnigetPlugin for CoursesPlugin {
             "get_platforms".into(),
             "get_platform_config".into(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_udemy_curriculum_command() {
+        let plugin = CoursesPlugin::new();
+
+        assert!(plugin.commands().iter().any(|command| command == "udemy_get_curriculum"));
     }
 }
 
