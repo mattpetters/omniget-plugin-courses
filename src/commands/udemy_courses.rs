@@ -39,6 +39,7 @@ fn parse_courses_from_results(results: &[serde_json::Value]) -> Vec<UdemyCourse>
                 .get("num_published_lectures")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32);
+            let locale = crate::platforms::udemy::api::extract_course_locale(item);
 
             Some(UdemyCourse {
                 id,
@@ -47,6 +48,7 @@ fn parse_courses_from_results(results: &[serde_json::Value]) -> Vec<UdemyCourse>
                 url,
                 image_url,
                 num_published_lectures,
+                locale,
             })
         })
         .collect()
@@ -141,7 +143,7 @@ async fn fetch_courses_via_api(
     // Subscribed (purchased) courses. page_size=100 is Udemy's per-request max;
     // fetch_all_pages follows the `next` cursor to gather every enrollment.
     let subscribed_url = format!(
-        "https://{}.udemy.com/api-2.0/users/me/subscribed-courses?fields[course]=id,url,title,published_title,image_240x135,num_published_lectures&ordering=-last_accessed,-access_time&page=1&page_size=100",
+        "https://{}.udemy.com/api-2.0/users/me/subscribed-courses?fields[course]=id,url,title,published_title,image_240x135,num_published_lectures,locale&ordering=-last_accessed,-access_time&page=1&page_size=100",
         portal
     );
     let subscribed = fetch_all_pages(&client, subscribed_url).await?;
@@ -149,7 +151,7 @@ async fn fetch_courses_via_api(
 
     // Subscription-plan enrollments (Personal Plan, etc.) — also paginated.
     let sub_url = format!(
-        "https://{}.udemy.com/api-2.0/users/me/subscription-course-enrollments?fields[course]=id,title,published_title,image_240x135,num_published_lectures&page=1&page_size=100",
+        "https://{}.udemy.com/api-2.0/users/me/subscription-course-enrollments?fields[course]=id,title,published_title,image_240x135,num_published_lectures,locale&page=1&page_size=100",
         portal
     );
     match fetch_all_pages(&client, sub_url).await {

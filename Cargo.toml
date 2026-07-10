@@ -1,6 +1,6 @@
 [package]
 name = "omniget-plugin-courses"
-version = "1.0.3"
+version = "1.0.6-mpfork"
 edition = "2021"
 
 [lib]

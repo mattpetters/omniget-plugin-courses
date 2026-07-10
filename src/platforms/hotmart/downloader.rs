@@ -12,9 +12,8 @@ use tokio_util::sync::CancellationToken;
 use omniget_core::core::filename;
 use omniget_core::core::media_processor::MediaProcessor;
 use omniget_core::models::media::{DownloadOptions, DownloadResult, MediaInfo, MediaType};
-use omniget_core::models::progress::ProgressUpdate;
 use omniget_core::models::settings::{self, DownloadSettings};
-use crate::platforms::traits::PlatformDownloader;
+use crate::platforms::traits::{PlatformDownloader, ProgressUpdate};
 
 use super::api::{self, Course, Lesson};
 use super::auth::HotmartSession;

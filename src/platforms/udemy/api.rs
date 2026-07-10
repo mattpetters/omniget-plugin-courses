@@ -14,6 +14,8 @@ pub struct UdemyCourse {
     pub url: Option<String>,
     pub image_url: Option<String>,
     pub num_published_lectures: Option<u32>,
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,8 @@ pub struct UdemyLecture {
     pub object_index: u32,
     pub lecture_class: String,
     pub asset: Option<serde_json::Value>,
+    #[serde(default)]
+    pub supplementary_assets: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +91,15 @@ async fn api_get_with_retry(
     url: &str,
     params: Option<&[(&str, &str)]>,
 ) -> Result<reqwest::Response> {
+    api_get_with_retry_and_user_agent(client, url, params, None).await
+}
+
+async fn api_get_with_retry_and_user_agent(
+    client: &reqwest::Client,
+    url: &str,
+    params: Option<&[(&str, &str)]>,
+    user_agent: Option<&str>,
+) -> Result<reqwest::Response> {
     let max_attempts: u32 = 3;
     let mut last_err = None;
 
@@ -94,6 +107,9 @@ async fn api_get_with_retry(
         let mut req = client.get(url);
         if let Some(p) = params {
             req = req.query(p);
+        }
+        if let Some(user_agent) = user_agent {
+            req = req.header(reqwest::header::USER_AGENT, user_agent);
         }
 
         match req.send().await {
@@ -196,6 +212,18 @@ async fn handle_pagination(
     Ok(data)
 }
 
+pub fn extract_course_locale(value: &serde_json::Value) -> Option<String> {
+    let locale = value.get("locale")?;
+    if let Some(s) = locale.as_str() {
+        return if s.is_empty() { None } else { Some(s.to_string()) };
+    }
+    locale
+        .get("locale")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 fn parse_course_from_json(item: &serde_json::Value) -> Option<UdemyCourse> {
     let id = item.get("id")?.as_u64()?;
     let title = item.get("title")?.as_str().unwrap_or("").to_string();
@@ -212,6 +240,8 @@ fn parse_course_from_json(item: &serde_json::Value) -> Option<UdemyCourse> {
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
 
+    let locale = extract_course_locale(item);
+
     Some(UdemyCourse {
         id,
         title,
@@ -219,6 +249,7 @@ fn parse_course_from_json(item: &serde_json::Value) -> Option<UdemyCourse> {
         url,
         image_url,
         num_published_lectures,
+        locale,
     })
 }
 
@@ -227,7 +258,7 @@ pub async fn list_my_courses(
     portal_name: &str,
 ) -> Result<Vec<UdemyCourse>> {
     let url = format!(
-        "https://{}.udemy.com/api-2.0/users/me/subscribed-courses?fields[course]=id,url,title,published_title,image_240x135,num_published_lectures&ordering=-last_accessed,-access_time&page=1&page_size=10000",
+        "https://{}.udemy.com/api-2.0/users/me/subscribed-courses?fields[course]=id,url,title,published_title,image_240x135,num_published_lectures,locale&ordering=-last_accessed,-access_time&page=1&page_size=10000",
         portal_name
     );
 
@@ -254,7 +285,7 @@ pub async fn list_subscription_courses(
     portal_name: &str,
 ) -> Result<Vec<UdemyCourse>> {
     let url = format!(
-        "https://{}.udemy.com/api-2.0/users/me/subscription-course-enrollments?fields[course]=title,published_title,image_240x135,num_published_lectures&page=1&page_size=50",
+        "https://{}.udemy.com/api-2.0/users/me/subscription-course-enrollments?fields[course]=title,published_title,image_240x135,num_published_lectures,locale&page=1&page_size=50",
         portal_name
     );
 
@@ -365,34 +396,29 @@ pub fn parse_curriculum(course_id: u64, results: &[serde_json::Value]) -> Result
 
                         if asset_type == "video" {
                             total_video_lectures += 1;
-                            let has_stream_urls = a.get("stream_urls")
-                                .map(|v| !v.is_null())
+                            let has_license_token = a
+                                .get("media_license_token")
+                                .and_then(|v| v.as_str())
+                                .map(|v| !v.trim().is_empty())
                                 .unwrap_or(false);
-                            let has_media_sources = a.get("media_sources")
-                                .map(|v| !v.is_null())
-                                .unwrap_or(false);
+                            let is_drm = a.get("course_is_drmed")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                                || has_license_token;
 
-                            if !has_stream_urls && has_media_sources {
-                                let is_drm = a.get("course_is_drmed")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false)
-                                    || a.get("media_license_token").is_some();
-
-                                let has_downloadable = a.get("media_sources")
-                                    .and_then(|v| v.as_array())
-                                    .map(|sources| sources.iter().any(|s| {
-                                        let t = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                        t == "video/mp4" || t == "application/x-mpegURL"
-                                    }))
-                                    .unwrap_or(false);
-
-                                if is_drm && !has_downloadable {
-                                    drm_video_lectures += 1;
-                                }
+                            // A DRM HLS master is still a downloadable media
+                            // source. Count it so the shared Widevine toolchain
+                            // is prepared before short-lived tokens are fetched.
+                            if is_drm {
+                                drm_video_lectures += 1;
                             }
                         }
                     }
                 }
+
+                let supplementary_assets = item.get("supplementary_assets")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().cloned().collect());
 
                 let lecture = UdemyLecture {
                     id,
@@ -400,6 +426,7 @@ pub fn parse_curriculum(course_id: u64, results: &[serde_json::Value]) -> Result
                     object_index,
                     lecture_class: class.to_string(),
                     asset,
+                    supplementary_assets,
                 };
 
                 if let Some(ref mut ch) = current_chapter {
@@ -438,6 +465,56 @@ pub fn parse_curriculum(course_id: u64, results: &[serde_json::Value]) -> Result
     })
 }
 
+pub async fn get_course_locale(
+    session: &UdemySession,
+    portal_name: &str,
+    course_id: u64,
+) -> Result<Option<String>> {
+    let url = format!(
+        "https://{}.udemy.com/api-2.0/courses/{}/",
+        portal_name, course_id
+    );
+    let params: &[(&str, &str)] = &[("fields[course]", "locale")];
+
+    let resp = api_get_with_retry(&session.client, &url, Some(params)).await?;
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow!("Failed to parse course locale response: {}", e))?;
+
+    Ok(extract_course_locale(&data))
+}
+
+pub async fn get_fresh_lecture_asset(
+    session: &UdemySession,
+    portal_name: &str,
+    course_id: u64,
+    lecture_id: u64,
+) -> Result<serde_json::Value> {
+    let url = format!(
+        "https://{}.udemy.com/api-2.0/users/me/subscribed-courses/{}/lectures/{}/",
+        portal_name, course_id, lecture_id
+    );
+    let params: &[(&str, &str)] = &[
+        ("fields[lecture]", "asset"),
+        ("fields[asset]", "title,filename,asset_type,status,media_license_token,course_is_drmed,media_sources,stream_urls,download_urls,captions"),
+    ];
+
+    // media_license_token is bound to this request's User-Agent. It must
+    // exactly match N_m3u8DL-RE and widevine_cdm.py.
+    let resp = api_get_with_retry_and_user_agent(
+        &session.client,
+        &url,
+        Some(params),
+        Some(omniget_core::core::udemy::UDEMY_UA),
+    ).await?;
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow!("Failed to parse lecture asset response: {}", e))?;
+
+    data.get("asset")
+        .filter(|a| !a.is_null())
+        .cloned()
+        .ok_or_else(|| anyhow!("Lecture response missing asset"))
+}
+
 pub async fn get_course_curriculum(
     session: &UdemySession,
     portal_name: &str,
@@ -467,4 +544,94 @@ pub async fn get_course_curriculum(
         .unwrap_or_default();
 
     parse_curriculum(course_id, &results)
+}
+
+pub async fn get_course_resources(
+    session: &UdemySession,
+    portal_name: &str,
+    course_id: u64,
+) -> Result<Vec<serde_json::Value>> {
+    let url = format!(
+        "https://{}.udemy.com/api-2.0/courses/{}/resources/",
+        portal_name, course_id
+    );
+
+    tracing::info!("[udemy-api] fetching resources for course {}", course_id);
+
+    let data = match api_get_with_retry(&session.client, &url, None).await {
+        Ok(resp) => {
+            let text = resp.text().await
+                .map_err(|e| anyhow!("Failed to read resources response: {}", e))?;
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| anyhow!("Failed to parse resources JSON: {}", e))?
+        }
+        Err(e) => {
+            tracing::warn!("[udemy-api] resources not available for course {}: {}", course_id, e);
+            return Ok(Vec::new());
+        }
+    };
+
+    let results = data.get("results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    tracing::info!("[udemy-api] found {} resources", results.len());
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curriculum_counts_drm_hls_as_drm_video() {
+        let results = vec![
+            serde_json::json!({
+                "_class": "chapter", "id": 1, "title": "Module 1", "object_index": 1
+            }),
+            serde_json::json!({
+                "_class": "lecture",
+                "id": 42,
+                "title": "Protected lecture",
+                "object_index": 1,
+                "asset": {
+                    "asset_type": "Video",
+                    "course_is_drmed": true,
+                    "media_license_token": "fresh-token",
+                    "media_sources": [{
+                        "type": "application/x-mpegURL",
+                        "src": "https://cdn.example/master.m3u8"
+                    }]
+                }
+            }),
+        ];
+
+        let curriculum = parse_curriculum(7, &results).unwrap();
+        assert_eq!(curriculum.total_video_lectures, 1);
+        assert_eq!(curriculum.drm_video_lectures, 1);
+    }
+
+    #[test]
+    fn empty_license_token_does_not_mark_plain_video_as_drm() {
+        let results = vec![serde_json::json!({
+            "_class": "lecture",
+            "id": 43,
+            "title": "Plain lecture",
+            "object_index": 1,
+            "asset": {
+                "asset_type": "Video",
+                "course_is_drmed": false,
+                "media_license_token": "",
+                "media_sources": [{
+                    "type": "video/mp4",
+                    "src": "https://cdn.example/video.mp4"
+                }]
+            }
+        })];
+
+        let curriculum = parse_curriculum(7, &results).unwrap();
+        assert_eq!(curriculum.total_video_lectures, 1);
+        assert_eq!(curriculum.drm_video_lectures, 0);
+    }
 }

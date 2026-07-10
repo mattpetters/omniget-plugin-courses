@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use futures::StreamExt;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 
 use omniget_core::core::media_processor::MediaProcessor;
+use omniget_core::core::{dependencies, udemy::drm};
+use omniget_core::models::progress::ProgressUpdate as CoreProgressUpdate;
 
 use super::api::{self, UdemyCourse};
 use super::auth::UdemySession;
@@ -40,6 +42,41 @@ pub struct UdemyDownloader {
     chapter_filter: HashSet<u32>,
     download_captions: bool,
     caption_locale: String,
+    course_locale: Option<String>,
+    widevine_device_path: Option<PathBuf>,
+    drm_runtime: OnceCell<DrmRuntime>,
+}
+
+struct DrmRuntime {
+    tools: drm::DrmTools,
+    wvd_path: PathBuf,
+}
+
+struct CaptionTrack {
+    url: String,
+    locale_id: String,
+    locale_prefix: String,
+    display_lang: String,
+    auto_generated: bool,
+}
+
+impl CaptionTrack {
+    fn canonical(&self) -> &str {
+        if !self.locale_id.is_empty() {
+            &self.locale_id
+        } else if !self.display_lang.is_empty() {
+            &self.display_lang
+        } else {
+            "unknown"
+        }
+    }
+
+    fn matches(&self, key: &str) -> bool {
+        !key.is_empty()
+            && (self.locale_id.to_lowercase() == key
+                || self.locale_prefix == key
+                || self.display_lang.to_lowercase() == key)
+    }
 }
 
 fn strip_emojis(input: &str) -> String {
@@ -103,6 +140,37 @@ pub(crate) fn parse_quality_pref(s: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+fn asset_is_drm(asset: &serde_json::Value) -> bool {
+    asset.get("course_is_drmed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || asset.get("media_license_token")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
+fn drm_hls_source(asset: &serde_json::Value) -> Option<&str> {
+    asset.get("media_sources")?
+        .as_array()?
+        .iter()
+        .find(|source| {
+            source.get("type").and_then(|v| v.as_str()) == Some("application/x-mpegURL")
+        })?
+        .get("src")?
+        .as_str()
+        .filter(|src| !src.trim().is_empty())
+}
+
+fn portal_host(portal_name: &str) -> String {
+    let portal_name = portal_name.trim().trim_end_matches('/');
+    if portal_name == "udemy.com" || portal_name.ends_with(".udemy.com") {
+        portal_name.to_string()
+    } else {
+        format!("{portal_name}.udemy.com")
+    }
+}
+
 impl UdemyDownloader {
     pub fn new(
         session: Arc<Mutex<Option<UdemySession>>>,
@@ -114,6 +182,8 @@ impl UdemyDownloader {
         chapter_filter: HashSet<u32>,
         download_captions: bool,
         caption_locale: String,
+        course_locale: Option<String>,
+        widevine_device_path: Option<PathBuf>,
     ) -> Self {
         let hls_client = omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
             .user_agent(USER_AGENT)
@@ -133,7 +203,42 @@ impl UdemyDownloader {
             chapter_filter,
             download_captions,
             caption_locale,
+            course_locale,
+            widevine_device_path,
+            drm_runtime: OnceCell::new(),
         }
+    }
+
+    async fn drm_runtime(&self) -> anyhow::Result<&DrmRuntime> {
+        self.drm_runtime.get_or_try_init(|| async {
+            let cdm_script = drm::materialize_cdm_script().await
+                .context("Failed to materialize the Widevine CDM helper")?;
+            let wvd_path = drm::resolve_widevine_device_path(
+                self.widevine_device_path.as_deref(),
+                &cdm_script,
+            ).context("Widevine device setup failed")?;
+            let python = dependencies::ensure_pywidevine_python().await
+                .context("Python with pywidevine is required for Udemy DRM decryption")?;
+            drm::preflight_widevine(&python, &wvd_path).await
+                .context("Python/pywidevine/WVD preflight failed")?;
+            let n_m3u8dl = dependencies::ensure_n_m3u8dl_re().await
+                .context("N_m3u8DL-RE is required for Udemy DRM downloads")?;
+            let mp4decrypt = dependencies::ensure_mp4decrypt().await
+                .context("mp4decrypt (Bento4) is required for Udemy DRM decryption")?;
+            let ffmpeg = dependencies::ensure_ffmpeg().await
+                .context("ffmpeg is required to mux decrypted Udemy video")?;
+
+            Ok(DrmRuntime {
+                tools: drm::DrmTools {
+                    n_m3u8dl,
+                    mp4decrypt,
+                    ffmpeg,
+                    python,
+                    cdm_script,
+                },
+                wvd_path,
+            })
+        }).await
     }
 
     pub async fn download_full_course(
@@ -143,7 +248,7 @@ impl UdemyDownloader {
         curriculum: api::UdemyCurriculum,
         progress_tx: mpsc::Sender<UdemyCourseDownloadProgress>,
         cancel_token: CancellationToken,
-    ) -> anyhow::Result<u32> {
+    ) -> anyhow::Result<()> {
         let session = {
             let guard = self.session.lock().await;
             guard.clone().ok_or_else(|| anyhow!("Not authenticated"))?
@@ -159,6 +264,23 @@ impl UdemyDownloader {
             total_lectures: curriculum.total_lectures,
             completed_lectures: 0,
         }).await;
+
+        // Prepare the full toolchain before fetching short-lived per-lecture
+        // tokens so license acquisition follows metadata refresh immediately.
+        if curriculum.drm_video_lectures > 0 {
+            let _ = progress_tx.send(UdemyCourseDownloadProgress {
+                course_id: course.id,
+                course_name: course.title.clone(),
+                percent: 0.0,
+                current_chapter: String::new(),
+                current_lecture: "Preparing Widevine tools".to_string(),
+                downloaded_bytes: 0,
+                total_lectures: curriculum.total_lectures,
+                completed_lectures: 0,
+            }).await;
+            self.drm_runtime().await
+                .context("Could not prepare the Udemy Widevine toolchain")?;
+        }
 
         let course_dir_name = safe_filename(&course.title);
         let course_dir = PathBuf::from(output_dir).join(&course_dir_name);
@@ -177,7 +299,6 @@ impl UdemyDownloader {
         };
         let mut completed_lectures: u32 = 0;
         let mut downloaded_bytes: u64 = 0;
-        let mut drm_skipped: u32 = 0;
         let mut global_lecture_counter: u32 = 0;
 
         for (ch_idx, chapter) in curriculum.chapters.iter().enumerate() {
@@ -229,30 +350,82 @@ impl UdemyDownloader {
                     completed_lectures,
                 }).await;
 
+                // Translate per-lecture Widevine updates into the existing
+                // full-course progress event and keep the DRM channel drained.
+                let (drm_progress_tx, mut drm_progress_rx) =
+                    mpsc::channel::<CoreProgressUpdate>(64);
+                let aggregate_progress_tx = progress_tx.clone();
+                let aggregate_course_id = course.id;
+                let aggregate_course_name = course.title.clone();
+                let aggregate_chapter = chapter.title.clone();
+                let aggregate_lecture = format!(
+                    "{}/{} - {}", lecture_num, chapter.lectures.len(), lecture.title
+                );
+                let aggregate_forwarder = tokio::spawn(async move {
+                    while let Some(update) = drm_progress_rx.recv().await {
+                        let lecture_fraction = if update.percent < 0.0 {
+                            0.0
+                        } else {
+                            update.percent.clamp(0.0, 100.0) / 100.0
+                        };
+                        let percent = if total_lectures > 0 {
+                            ((completed_lectures as f64 + lecture_fraction)
+                                / total_lectures as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let _ = aggregate_progress_tx.send(UdemyCourseDownloadProgress {
+                            course_id: aggregate_course_id,
+                            course_name: aggregate_course_name.clone(),
+                            percent,
+                            current_chapter: aggregate_chapter.clone(),
+                            current_lecture: aggregate_lecture.clone(),
+                            downloaded_bytes: downloaded_bytes.saturating_add(
+                                update.downloaded_bytes.unwrap_or(0)
+                            ),
+                            total_lectures,
+                            completed_lectures,
+                        }).await;
+                    }
+                });
+
                 let result = self.download_lecture(
                     &session,
+                    course.id,
                     lecture,
                     &chapter_dir,
                     &cancel_token,
                     lecture_num,
+                    &drm_progress_tx,
                 ).await;
+                drop(drm_progress_tx);
+                let _ = aggregate_forwarder.await;
 
                 match result {
-                    Ok((b, drm)) => {
+                    Ok(b) => {
                         downloaded_bytes += b;
-                        drm_skipped += drm;
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "[udemy] failed to download lecture '{}': {}",
-                            lecture.title, e
-                        );
+                        return Err(e.context(format!(
+                            "Failed to download lecture '{}'", lecture.title
+                        )));
                     }
                 }
 
                 if lecture.lecture_class == "lecture" {
                     completed_lectures += 1;
                 }
+            }
+        }
+
+        tracing::info!("[udemy] downloading course-level resources for '{}'", course.title);
+        match self.download_course_resources(&session, course.id, &course_dir).await {
+            Ok(b) => {
+                downloaded_bytes += b;
+                tracing::info!("[udemy] resources downloaded: {} bytes", b);
+            }
+            Err(e) => {
+                tracing::warn!("[udemy] resources download skipped: {}", e);
             }
         }
 
@@ -268,21 +441,23 @@ impl UdemyDownloader {
         }).await;
 
         tracing::info!(
-            "[udemy] course '{}' download complete: {} lectures, {} bytes, {} drm-skipped",
-            course.title, completed_lectures, downloaded_bytes, drm_skipped
+            "[udemy] course '{}' download complete: {} lectures, {} bytes",
+            course.title, completed_lectures, downloaded_bytes
         );
 
-        Ok(drm_skipped)
+        Ok(())
     }
 
     async fn download_lecture(
         &self,
         session: &UdemySession,
+        course_id: u64,
         lecture: &api::UdemyLecture,
         chapter_dir: &Path,
         cancel_token: &CancellationToken,
         lecture_num: u32,
-    ) -> anyhow::Result<(u64, u32)> {
+        drm_progress: &mpsc::Sender<CoreProgressUpdate>,
+    ) -> anyhow::Result<u64> {
         if lecture.lecture_class == "quiz" || lecture.lecture_class == "practice" {
             let quiz_file = chapter_dir.join(format!("{:02} - {} [quiz].json", lecture_num, safe_filename(&lecture.title)));
             if !file_exists_with_content(&quiz_file) {
@@ -293,12 +468,12 @@ impl UdemyDownloader {
                     }
                 }
             }
-            return Ok((0, 0));
+            return Ok(0);
         }
 
         let asset = match &lecture.asset {
             Some(a) => a,
-            None => return Ok((0, 0)),
+            None => return Ok(0),
         };
 
         let asset_type = asset.get("asset_type")
@@ -308,15 +483,13 @@ impl UdemyDownloader {
             .to_lowercase();
 
         let mut total_bytes: u64 = 0;
-        let mut drm_skipped: u32 = 0;
-
         match asset_type.as_str() {
             "video" => {
-                let (bytes, drm) = self.download_video_asset(
-                    session, asset, &lecture.title, chapter_dir, cancel_token, lecture_num
+                let bytes = self.download_video_asset(
+                    session, course_id, lecture.id, asset, &lecture.title, chapter_dir,
+                    cancel_token, lecture_num, drm_progress
                 ).await?;
                 total_bytes += bytes;
-                drm_skipped += drm;
             }
             "article" => {
                 let body = asset.get("body").and_then(|v| v.as_str()).unwrap_or("");
@@ -346,124 +519,14 @@ impl UdemyDownloader {
         }
 
         if self.download_captions {
-            let captions = asset.get("captions").and_then(|v| v.as_array());
-            if let Some(tracks) = captions {
-                let wanted = self.caption_locale.trim().to_lowercase();
-                let mut matched_any = false;
-                let mut available: Vec<String> = Vec::new();
-
-                for track in tracks {
-                    let class = track.get("_class").and_then(|v| v.as_str()).unwrap_or("");
-                    if class != "caption" {
-                        continue;
-                    }
-                    let url = match track.get("url").and_then(|v| v.as_str()) {
-                        Some(u) => u,
-                        None => continue,
-                    };
-
-                    let locale_id_raw = track
-                        .get("locale_id")
-                        .or_else(|| track.get("localeId"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let locale_id_lc = locale_id_raw.to_lowercase();
-                    let locale_prefix = locale_id_lc
-                        .split('_')
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-
-                    let display_lang = track
-                        .get("language")
-                        .or_else(|| track.get("srclang"))
-                        .or_else(|| track.get("label"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
-                    let track_label = if !locale_id_raw.is_empty() {
-                        locale_id_raw.clone()
-                    } else {
-                        display_lang.to_string()
-                    };
-                    if !track_label.is_empty() {
-                        available.push(track_label.clone());
-                    }
-
-                    let keep = wanted == "all"
-                        || (!wanted.is_empty()
-                            && (locale_id_lc == wanted
-                                || locale_prefix == wanted
-                                || display_lang.to_lowercase() == wanted));
-                    if !keep {
-                        continue;
-                    }
-
-                    matched_any = true;
-
-                    let canonical = if !locale_id_raw.is_empty() {
-                        locale_id_raw.clone()
-                    } else if !display_lang.is_empty() {
-                        display_lang.to_string()
-                    } else {
-                        "unknown".to_string()
-                    };
-                    let canonical_safe = safe_filename(&canonical);
-
-                    let ext = if url.contains(".vtt") { "vtt" } else { "srt" };
-                    let caption_name = format!(
-                        "{:02} - {}.{}.{}",
-                        lecture_num,
-                        safe_filename(&lecture.title),
-                        canonical_safe,
-                        ext
-                    );
-                    let caption_path = chapter_dir.join(&caption_name);
-
-                    if !file_exists_with_content(&caption_path) {
-                        match download_file_simple(&session.client, url, &caption_path).await {
-                            Ok(b) => {
-                                total_bytes += b;
-                                tracing::info!("[udemy] saved caption: {}", caption_name);
-                            }
-                            Err(e) => {
-                                tracing::warn!("[udemy] failed to download caption '{}': {}", caption_name, e);
-                            }
-                        }
-                    }
-
-                    if ext == "vtt" && file_exists_with_content(&caption_path) {
-                        let srt_path = caption_path.with_extension("srt");
-                        if !file_exists_with_content(&srt_path) {
-                            match vtt_to_srt(&caption_path, &srt_path) {
-                                Ok(()) => {
-                                    tracing::info!("[udemy] converted caption to srt: {}", srt_path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-                                    if !self.keep_vtt {
-                                        let _ = std::fs::remove_file(&caption_path);
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("[udemy] vtt→srt conversion failed for '{}': {}", caption_name, e);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !matched_any && !available.is_empty() && wanted != "all" && !wanted.is_empty() {
-                    tracing::warn!(
-                        "[udemy] no caption matched locale '{}' for lecture '{}'. Available: {:?}",
-                        self.caption_locale,
-                        lecture.title,
-                        available
-                    );
-                }
+            if let Some(tracks) = asset.get("captions").and_then(|v| v.as_array()) {
+                total_bytes += self.download_lecture_captions(
+                    session, tracks, &lecture.title, chapter_dir, lecture_num
+                ).await;
             }
         }
 
-        let supp_assets = asset.get("supplementary_assets").and_then(|v| v.as_array());
-        if let Some(assets) = supp_assets {
+        if let Some(assets) = &lecture.supplementary_assets {
             for supp in assets {
                 total_bytes += self.download_supplementary_asset(
                     session, supp, chapter_dir, lecture_num
@@ -471,10 +534,340 @@ impl UdemyDownloader {
             }
         }
 
-        Ok((total_bytes, drm_skipped))
+        Ok(total_bytes)
+    }
+
+    async fn download_lecture_captions(
+        &self,
+        session: &UdemySession,
+        tracks: &[serde_json::Value],
+        lecture_title: &str,
+        chapter_dir: &Path,
+        lecture_num: u32,
+    ) -> u64 {
+        let mut candidates: Vec<CaptionTrack> = Vec::new();
+
+        for track in tracks {
+            let class = track.get("_class").and_then(|v| v.as_str()).unwrap_or("");
+            if class != "caption" {
+                continue;
+            }
+            let url = match track.get("url").and_then(|v| v.as_str()) {
+                Some(u) => u.to_string(),
+                None => continue,
+            };
+
+            let locale_id = track
+                .get("locale_id")
+                .or_else(|| track.get("localeId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let locale_prefix = locale_id
+                .to_lowercase()
+                .split('_')
+                .next()
+                .unwrap_or("")
+                .to_string();
+
+            let display_lang = track
+                .get("language")
+                .or_else(|| track.get("srclang"))
+                .or_else(|| track.get("label"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let auto_generated = track
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("auto"))
+                .unwrap_or(false)
+                || track
+                    .get("video_label")
+                    .or_else(|| track.get("title"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase().contains("auto"))
+                    .unwrap_or(false);
+
+            candidates.push(CaptionTrack {
+                url,
+                locale_id,
+                locale_prefix,
+                display_lang,
+                auto_generated,
+            });
+        }
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let wanted = self.caption_locale.trim().to_lowercase();
+
+        if wanted == "all" {
+            let mut bytes: u64 = 0;
+            for track in &candidates {
+                bytes += self.download_caption_track(
+                    session, &track.url, track.canonical(), lecture_title, chapter_dir, lecture_num
+                ).await;
+            }
+            return bytes;
+        }
+
+        let pick = |key: &str| -> Option<usize> {
+            let group: Vec<usize> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.matches(key))
+                .map(|(i, _)| i)
+                .collect();
+            group
+                .iter()
+                .copied()
+                .find(|&i| !candidates[i].auto_generated)
+                .or_else(|| group.first().copied())
+        };
+
+        let course_locale_lc = self
+            .course_locale
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let course_prefix = course_locale_lc
+            .split('_')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        let mut chosen: Option<usize> = None;
+        if !wanted.is_empty() {
+            chosen = pick(&wanted);
+            if chosen.is_none() {
+                let available: Vec<&str> = candidates.iter().map(|t| t.canonical()).collect();
+                tracing::warn!(
+                    "[udemy] no caption matched requested locale '{}' for lecture '{}'. Available: {:?}; falling back to course locale/English",
+                    self.caption_locale,
+                    lecture_title,
+                    available
+                );
+            }
+        }
+        if chosen.is_none() && !course_locale_lc.is_empty() {
+            chosen = pick(&course_locale_lc).or_else(|| pick(&course_prefix));
+        }
+        if chosen.is_none() {
+            chosen = pick("en");
+        }
+        if chosen.is_none() {
+            chosen = candidates
+                .iter()
+                .position(|t| !t.auto_generated)
+                .or(if candidates.is_empty() { None } else { Some(0) });
+        }
+
+        let track = match chosen {
+            Some(i) => &candidates[i],
+            None => return 0,
+        };
+
+        tracing::info!(
+            "[udemy] caption selected: locale='{}' auto_generated={} (requested='{}', course_locale='{}') for '{}'",
+            track.canonical(),
+            track.auto_generated,
+            self.caption_locale,
+            self.course_locale.as_deref().unwrap_or("unknown"),
+            lecture_title
+        );
+
+        self.download_caption_track(
+            session, &track.url, track.canonical(), lecture_title, chapter_dir, lecture_num
+        ).await
+    }
+
+    async fn download_caption_track(
+        &self,
+        session: &UdemySession,
+        url: &str,
+        canonical: &str,
+        lecture_title: &str,
+        chapter_dir: &Path,
+        lecture_num: u32,
+    ) -> u64 {
+        let canonical_safe = safe_filename(canonical);
+        let ext = if url.contains(".vtt") { "vtt" } else { "srt" };
+        let caption_name = format!(
+            "{:02} - {}.{}.{}",
+            lecture_num,
+            safe_filename(lecture_title),
+            canonical_safe,
+            ext
+        );
+        let caption_path = chapter_dir.join(&caption_name);
+
+        let mut bytes: u64 = 0;
+        if !file_exists_with_content(&caption_path) {
+            match download_file_simple(&session.client, url, &caption_path).await {
+                Ok(b) => {
+                    bytes = b;
+                    tracing::info!("[udemy] saved caption: {}", caption_name);
+                }
+                Err(e) => {
+                    tracing::warn!("[udemy] failed to download caption '{}': {}", caption_name, e);
+                }
+            }
+        }
+
+        if ext == "vtt" && file_exists_with_content(&caption_path) {
+            let srt_path = caption_path.with_extension("srt");
+            if !file_exists_with_content(&srt_path) {
+                match vtt_to_srt(&caption_path, &srt_path) {
+                    Ok(()) => {
+                        tracing::info!("[udemy] converted caption to srt: {}", srt_path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+                        if !self.keep_vtt {
+                            let _ = std::fs::remove_file(&caption_path);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[udemy] vtt→srt conversion failed for '{}': {}", caption_name, e);
+                    }
+                }
+            }
+        }
+
+        bytes
     }
 
     async fn download_video_asset(
+        &self,
+        session: &UdemySession,
+        course_id: u64,
+        lecture_id: u64,
+        asset: &serde_json::Value,
+        title: &str,
+        chapter_dir: &Path,
+        cancel_token: &CancellationToken,
+        lecture_num: u32,
+        drm_progress: &mpsc::Sender<CoreProgressUpdate>,
+    ) -> anyhow::Result<u64> {
+        let file_name = format!("{:02} - {}.mp4", lecture_num, safe_filename(title));
+        let file_path = chapter_dir.join(&file_name);
+
+        if file_exists_with_content(&file_path) {
+            tracing::info!("[udemy] skipping existing video: {}", file_name);
+            return Ok(0);
+        }
+
+        let curriculum_signaled_drm = asset_is_drm(asset);
+        let mut refreshed = match api::get_fresh_lecture_asset(
+            session, &session.portal_name, course_id, lecture_id
+        ).await {
+            Ok(fresh) => Some(fresh),
+            Err(e) => {
+                if curriculum_signaled_drm {
+                    return Err(e).context(format!(
+                        "Could not refresh the short-lived DRM metadata/token for '{}'", title
+                    ));
+                }
+                tracing::warn!(
+                    "[udemy] could not refresh media URLs for '{}', using curriculum data: {}",
+                    title, e
+                );
+                None
+            }
+        };
+        let effective_asset = refreshed.as_ref().unwrap_or(asset);
+
+        if asset_is_drm(effective_asset) {
+            // If fresh detail reveals DRM that the curriculum omitted, prepare
+            // tools and refresh again so provisioning cannot age the token.
+            let runtime_was_ready = self.drm_runtime.get().is_some();
+            self.drm_runtime().await
+                .context("Could not prepare the Udemy Widevine toolchain")?;
+            if !runtime_was_ready {
+                refreshed = Some(api::get_fresh_lecture_asset(
+                    session, &session.portal_name, course_id, lecture_id
+                ).await.context("Could not refresh DRM metadata after tool preflight")?);
+            }
+            let drm_asset = refreshed.as_ref().unwrap_or(asset);
+            return self.download_drm_video(
+                session,
+                drm_asset,
+                title,
+                chapter_dir,
+                cancel_token,
+                lecture_num,
+                drm_progress,
+            ).await;
+        }
+
+        let stream_urls = effective_asset.get("stream_urls");
+        if let Some(streams) = stream_urls {
+            if let Some(videos) = streams.get("Video").and_then(|v| v.as_array()) {
+                match self.download_from_stream_urls(
+                    session, videos, &file_path, title, cancel_token
+                ).await {
+                    Ok(bytes) if bytes > 0 => return Ok(bytes),
+                    Ok(_) => {}
+                    Err(e) => return self.map_video_download_error(e, title),
+                }
+            }
+        }
+
+        if let Some(sources) = effective_asset.get("media_sources").and_then(|v| v.as_array()) {
+            let result = self.download_from_media_sources(
+                session, sources, &file_path, title, cancel_token
+            ).await;
+
+            match result {
+                Ok(bytes) if bytes > 0 => return Ok(bytes),
+                Ok(_) => {}
+                Err(e) => return self.map_video_download_error(e, title),
+            }
+
+            return Err(anyhow!(
+                "No usable video source was returned for '{}' (media source types: {})",
+                title,
+                sources.iter()
+                    .filter_map(|s| s.get("type").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        Err(anyhow!(
+            "No video sources were returned for '{}' after refreshing the lecture metadata",
+            title
+        ))
+    }
+
+    fn map_video_download_error(
+        &self,
+        e: anyhow::Error,
+        title: &str,
+    ) -> anyhow::Result<u64> {
+        let msg = e.to_string();
+
+        if msg.contains("SAMPLE-AES") {
+            return Err(anyhow!(
+                "Protected HLS was detected for '{}' but Udemy did not return the Widevine metadata required to decrypt it: {}",
+                title, msg
+            ));
+        }
+
+        if msg.contains("403") {
+            return Err(anyhow!(
+                "Access denied (403) downloading '{}': the media URL was rejected even after being refreshed — the account may lack access to this lecture or it is region-restricted (not DRM)",
+                title
+            ));
+        }
+
+        Err(e).context(format!("Video download failed for '{}'", title))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn download_drm_video(
         &self,
         session: &UdemySession,
         asset: &serde_json::Value,
@@ -482,77 +875,51 @@ impl UdemyDownloader {
         chapter_dir: &Path,
         cancel_token: &CancellationToken,
         lecture_num: u32,
-    ) -> anyhow::Result<(u64, u32)> {
-        let file_name = format!("{:02} - {}.mp4", lecture_num, safe_filename(title));
-        let file_path = chapter_dir.join(&file_name);
+        progress: &mpsc::Sender<CoreProgressUpdate>,
+    ) -> anyhow::Result<u64> {
+        let token = asset.get("media_license_token")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| anyhow!(
+                "DRM lecture '{}' did not include a fresh media_license_token; refresh the Udemy session/cookies and retry",
+                title
+            ))?;
+        let hls_url = drm_hls_source(asset).ok_or_else(|| anyhow!(
+            "DRM lecture '{}' did not include a Widevine HLS master playlist", title
+        ))?;
+        let runtime = self.drm_runtime().await?;
+        let base_name = format!("{:02} - {}", lecture_num, safe_filename(title));
+        let quality = self.target_quality
+            .map(|quality| quality.to_string())
+            .unwrap_or_else(|| "best".to_string());
+        let license_url = format!(
+            "https://{}/media-license-server/validate-auth-token",
+            portal_host(&session.portal_name)
+        );
 
-        if file_exists_with_content(&file_path) {
-            tracing::info!("[udemy] skipping existing video: {}", file_name);
-            return Ok((0, 0));
+        let path = drm::download_drm(
+            hls_url,
+            token,
+            &license_url,
+            chapter_dir,
+            &base_name,
+            &quality,
+            Some(&runtime.wvd_path),
+            &runtime.tools,
+            cancel_token,
+            progress,
+        ).await.map_err(|error| anyhow!(
+            "Udemy Widevine decryption failed for '{}': {error:#}", title
+        ))?;
+
+        let metadata = std::fs::metadata(&path).with_context(|| format!(
+            "Decrypted output is missing for '{}': {}", title, path.display()
+        ))?;
+        if metadata.len() == 0 {
+            let _ = std::fs::remove_file(&path);
+            return Err(anyhow!("Decrypted output is empty (0 bytes) for '{}'", title));
         }
-
-        let stream_urls = asset.get("stream_urls");
-        if let Some(streams) = stream_urls {
-            if let Some(videos) = streams.get("Video").and_then(|v| v.as_array()) {
-                match self.download_from_stream_urls(
-                    session, videos, &file_path, title, cancel_token
-                ).await {
-                    Ok(bytes) => return Ok((bytes, 0)),
-                    Err(e) if e.to_string().contains("SAMPLE-AES") => {
-                        tracing::warn!("[udemy] DRM-protected (SAMPLE-AES) via stream_urls: '{}'", title);
-                        return Ok((0, 1));
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        if let Some(sources) = asset.get("media_sources").and_then(|v| v.as_array()) {
-            let result = self.download_from_media_sources(
-                session, sources, &file_path, title, cancel_token
-            ).await;
-
-            match result {
-                Ok(bytes) if bytes > 0 => return Ok((bytes, 0)),
-                Ok(_) => {}
-                Err(e) => {
-                    let is_drm = asset.get("course_is_drmed")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if is_drm || e.to_string().contains("SAMPLE-AES") {
-                        tracing::warn!("[udemy] DRM-protected video skipped: '{}'", title);
-                        return Ok((0, 1));
-                    }
-                    tracing::warn!("[udemy] media_sources download failed for '{}': {}", title, e);
-                    return Err(e);
-                }
-            }
-
-            let is_drm = asset.get("course_is_drmed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if is_drm {
-                tracing::warn!(
-                    "[udemy] DRM-protected video skipped: '{}' (no downloadable sources available)",
-                    title
-                );
-                return Ok((0, 1));
-            }
-
-            tracing::warn!(
-                "[udemy] no usable video sources in media_sources for '{}' (types: {})",
-                title,
-                sources.iter()
-                    .filter_map(|s| s.get("type").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            return Ok((0, 0));
-        }
-
-        tracing::warn!("[udemy] no video sources found for '{}'", title);
-        Ok((0, 0))
+        Ok(metadata.len())
     }
 
     async fn download_from_stream_urls(
@@ -802,43 +1169,134 @@ impl UdemyDownloader {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        match asset_type.as_str() {
-            "file" | "sourcecode" => {
-                let download_url = supp.get("download_urls")
-                    .and_then(|d| {
-                        if let Some(obj) = d.as_object() {
-                            for (_key, val) in obj {
-                                if let Some(arr) = val.as_array() {
-                                    if let Some(first) = arr.first() {
-                                        return first.get("file").and_then(|f| f.as_str()).map(|s| s.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    });
-
-                let url = match download_url {
-                    Some(u) => u,
-                    None => return Ok(0),
-                };
-
+        if asset_type == "externallink" {
+            let external_url = supp.get("external_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !external_url.is_empty() {
                 let base = if filename.is_empty() {
                     safe_filename(title)
                 } else {
                     safe_filename(filename)
                 };
-                let safe_name = format!("{:02} - {}", lecture_num, base);
+                let safe_name = format!("{:02} - {}.url", lecture_num, base);
                 let file_path = chapter_dir.join(&safe_name);
+                if !file_exists_with_content(&file_path) {
+                    let content = format!("[InternetShortcut]\nURL={}", external_url);
+                    std::fs::write(&file_path, content.as_bytes())?;
+                }
+            }
+            return Ok(0);
+        }
+
+        let download_url = supp.get("download_urls")
+            .and_then(|d| {
+                if let Some(obj) = d.as_object() {
+                    for (_key, val) in obj {
+                        if let Some(arr) = val.as_array() {
+                            if let Some(first) = arr.first() {
+                                return first.get("file").and_then(|f| f.as_str()).map(|s| s.to_string());
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+        let url = match download_url {
+            Some(u) => u,
+            None => return Ok(0),
+        };
+
+        let base = if filename.is_empty() {
+            safe_filename(title)
+        } else {
+            safe_filename(filename)
+        };
+        let safe_name = format!("{:02} - {}", lecture_num, base);
+        let file_path = chapter_dir.join(&safe_name);
+
+        if file_exists_with_content(&file_path) {
+            return Ok(0);
+        }
+
+        match download_file_simple(&session.client, &url, &file_path).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    "[udemy] failed to download supplementary asset '{}': {}",
+                    safe_name,
+                    e
+                );
+                Ok(0)
+            }
+        }
+    }
+
+    async fn download_course_resources(
+        &self,
+        session: &UdemySession,
+        course_id: u64,
+        course_dir: &Path,
+    ) -> anyhow::Result<u64> {
+        let resources = api::get_course_resources(
+            session, &session.portal_name, course_id
+        ).await?;
+
+        if resources.is_empty() {
+            return Ok(0);
+        }
+
+        let res_dir = course_dir.join("00 - Course Resources");
+        std::fs::create_dir_all(&res_dir)?;
+
+        let mut total_bytes: u64 = 0;
+
+        for (i, res) in resources.iter().enumerate() {
+            let title = res.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let filename = res.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+
+            let download_url = res.get("download_urls").and_then(|d| {
+                if let Some(obj) = d.as_object() {
+                    for (_key, val) in obj {
+                        if let Some(arr) = val.as_array() {
+                            if let Some(first) = arr.first() {
+                                if let Some(url) = first.get("file").and_then(|f| f.as_str()) {
+                                    return Some(url.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+            if let Some(url) = download_url {
+                let base = if filename.is_empty() {
+                    safe_filename(title)
+                } else {
+                    safe_filename(filename)
+                };
+                let safe_name = format!("{:02} - {}", i + 1, base);
+                let file_path = res_dir.join(&safe_name);
 
                 if file_exists_with_content(&file_path) {
-                    return Ok(0);
+                    total_bytes += std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                    continue;
                 }
 
-                download_file_simple(&session.client, &url, &file_path).await.ok();
-            }
-            "externallink" => {
-                let external_url = supp.get("external_url")
+                match download_file_simple(&session.client, &url, &file_path).await {
+                    Ok(b) => {
+                        total_bytes += b;
+                        tracing::info!("[udemy] downloaded resource: {}", safe_name);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[udemy] failed to download resource '{}': {}", safe_name, e);
+                    }
+                }
+            } else {
+                let external_url = res.get("url")
+                    .or_else(|| res.get("external_url"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !external_url.is_empty() {
@@ -847,18 +1305,17 @@ impl UdemyDownloader {
                     } else {
                         safe_filename(filename)
                     };
-                    let safe_name = format!("{:02} - {}.url", lecture_num, base);
-                    let file_path = chapter_dir.join(&safe_name);
+                    let safe_name = format!("{:02} - {}.url", i + 1, base);
+                    let file_path = res_dir.join(&safe_name);
                     if !file_exists_with_content(&file_path) {
                         let content = format!("[InternetShortcut]\nURL={}", external_url);
                         std::fs::write(&file_path, content.as_bytes())?;
                     }
                 }
             }
-            _ => {}
         }
 
-        Ok(0)
+        Ok(total_bytes)
     }
 }
 
@@ -902,8 +1359,11 @@ async fn download_file_inner(
 
     let status = resp.status();
     if !status.is_success() {
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(anyhow!("Auth error ({}), session may have expired", status));
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(anyhow!("Access denied (403): the signed media URL was rejected (expired signature or restricted access)"));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(anyhow!("Auth error (401), session may have expired"));
         }
         return Err(anyhow!("Download returned status {}", status));
     }
@@ -924,4 +1384,40 @@ async fn download_file_inner(
     std::fs::rename(part_path, output_path)?;
 
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_drm_only_from_true_flag_or_nonempty_token() {
+        assert!(asset_is_drm(&serde_json::json!({"course_is_drmed": true})));
+        assert!(asset_is_drm(&serde_json::json!({"media_license_token": "token"})));
+        assert!(!asset_is_drm(&serde_json::json!({
+            "course_is_drmed": false,
+            "media_license_token": "  "
+        })));
+    }
+
+    #[test]
+    fn selects_widevine_hls_master() {
+        let asset = serde_json::json!({
+            "media_sources": [
+                {"type": "video/mp4", "src": "https://cdn.example/video.mp4"},
+                {"type": "application/x-mpegURL", "src": "https://cdn.example/master.m3u8"}
+            ]
+        });
+        assert_eq!(
+            drm_hls_source(&asset),
+            Some("https://cdn.example/master.m3u8")
+        );
+    }
+
+    #[test]
+    fn builds_license_host_for_consumer_and_enterprise_portals() {
+        assert_eq!(portal_host("www"), "www.udemy.com");
+        assert_eq!(portal_host("intuit"), "intuit.udemy.com");
+        assert_eq!(portal_host("intuit.udemy.com"), "intuit.udemy.com");
+    }
 }

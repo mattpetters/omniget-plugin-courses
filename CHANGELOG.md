@@ -6,4 +6,6 @@ All notable changes to this project will be documented in this file.
 
 <!-- git-changelog-on-commit: 714974aa916fc21e1c1feb8454985735fad45c9f -->
 ### Changed
-- Updated Cargo.lock,src/commands/udemy_courses.rs src/platforms/hotmart/downloader.rs,src/platforms/kiwify/downloader.rs src/platforms/kiwify/mod.rs,src/platforms/rocketseat/downloader.rs src/platforms/rocketseat/mod.rs based on the staged diff so the commit records the current implementation changes.
+- Merged upstream 1.0.5 (ABI v3, fresh Udemy media URLs, and supplementary resources) while preserving paginated enrollment discovery.
+- Integrated full-course Udemy Widevine downloads with the shared omniget DRM toolchain, fresh UA-bound license tokens, cancellation, aggregate progress, and non-empty output validation.
+- DRM lecture failures now fail the course download explicitly instead of being skipped and reported as a successful completion.

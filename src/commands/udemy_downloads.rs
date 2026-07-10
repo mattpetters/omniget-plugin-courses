@@ -149,14 +149,6 @@ pub async fn start_udemy_course_download(
         }
     };
 
-    if curriculum.drm_video_lectures > 0
-        && curriculum.drm_video_lectures == curriculum.total_video_lectures
-        && curriculum.total_video_lectures > 0
-    {
-        active.lock().await.remove(&course_id);
-        return Err("drm_protected".to_string());
-    }
-
     let settings = crate::settings_reader::load_app_settings();
     let target_quality = crate::platforms::udemy::downloader::parse_quality_pref(
         &settings.download.video_quality,
@@ -169,6 +161,37 @@ pub async fn start_udemy_course_download(
 
     let download_captions = settings.download.download_subtitles;
     let caption_locale = settings.download.caption_locale.clone();
+    let widevine_device_path = (!settings.download.widevine_device_path.trim().is_empty())
+        .then(|| std::path::PathBuf::from(settings.download.widevine_device_path.trim()));
+
+    let course_locale = if download_captions {
+        match course.locale.clone().filter(|l| !l.trim().is_empty()) {
+            Some(l) => Some(l),
+            None => {
+                let session_snapshot = { plugin.udemy_session.lock().await.clone() };
+                match session_snapshot {
+                    Some(s) => match api::get_course_locale(&s, &portal, course_id).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!("[udemy] failed to fetch course locale for {}: {}", course_id, e);
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    if download_captions {
+        tracing::info!(
+            "[udemy] caption selection inputs: requested='{}', course_locale='{}'",
+            caption_locale,
+            course_locale.as_deref().unwrap_or("unknown")
+        );
+    }
 
     tokio::spawn(async move {
         let downloader = UdemyDownloader::new(
@@ -181,6 +204,8 @@ pub async fn start_udemy_course_download(
             chapter_filter,
             download_captions,
             caption_locale,
+            course_locale,
+            widevine_device_path,
         );
         let (tx, mut rx) = mpsc::channel(32);
 
@@ -203,21 +228,13 @@ pub async fn start_udemy_course_download(
         }
 
         match result {
-            Ok(drm_skipped) => {
-                if drm_skipped > 0 {
-                    let _ = host.emit_event("udemy-download-progress", serde_json::json!({
-                        "courseId": course_id,
-                        "type": "drm_warning",
-                        "drm_skipped": drm_skipped,
-                        "message": format!("{} lectures have DRM protection and were skipped", drm_skipped)
-                    }));
-                }
+            Ok(()) => {
                 let _ = host.emit_event(
                     "udemy-download-complete", serde_json::to_value(&UdemyDownloadCompleteEvent {
                         course_name: course.title,
                         success: true,
                         error: None,
-                        drm_skipped,
+                        drm_skipped: 0,
                     },).unwrap_or_default());
             }
             Err(e) => {
