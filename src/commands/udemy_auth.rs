@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use crate::platforms::udemy::auth::{
-    authenticate_with_cookie_json, delete_saved_session, load_saved_session,
-    request_otp, save_session, verify_otp,
+    authenticate_with_cookie_json, authenticate_with_netscape_cookie_file,
+    delete_saved_session, load_saved_session, request_otp, save_session, verify_otp,
 };
 
 
@@ -92,7 +92,26 @@ pub async fn udemy_check_session(
                 *guard = Some(session);
             }
             Err(_) => {
-                return Err("not_authenticated".to_string());
+                let managed_cookie_file = plugin
+                    .host
+                    .as_ref()
+                    .and_then(|host| host.get_cookie_file("udemy.com", None));
+                let Some(cookie_file) = managed_cookie_file else {
+                    return Err("not_authenticated".to_string());
+                };
+                match authenticate_with_netscape_cookie_file(&cookie_file).await {
+                    Ok(session) => {
+                        let _ = save_session(&session).await;
+                        *plugin.udemy_session.lock().await = Some(session);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[udemy] managed cookie session restore failed: {}",
+                            error
+                        );
+                        return Err("not_authenticated".to_string());
+                    }
+                }
             }
         }
     }

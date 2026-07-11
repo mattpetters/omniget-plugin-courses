@@ -462,6 +462,68 @@ pub async fn authenticate_with_cookie_json(cookie_json_str: &str) -> anyhow::Res
     })
 }
 
+fn parse_netscape_cookie_file(contents: &str) -> Vec<CookieEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            let line = if let Some(rest) = line.strip_prefix("#HttpOnly_") {
+                rest
+            } else if line.is_empty() || line.starts_with('#') {
+                return None;
+            } else {
+                line
+            };
+
+            let columns: Vec<&str> = line.splitn(7, '\t').collect();
+            if columns.len() != 7 {
+                return None;
+            }
+
+            Some(CookieEntry {
+                domain: Some(columns[0].to_string()),
+                path: Some(columns[2].to_string()),
+                name: columns[5].to_string(),
+                value: columns[6].to_string(),
+            })
+        })
+        .collect()
+}
+
+fn portal_from_cookie_entries(cookies: &[CookieEntry]) -> String {
+    let portals: Vec<String> = cookies
+        .iter()
+        .filter_map(|cookie| cookie.domain.as_deref())
+        .filter_map(|domain| {
+            domain
+                .trim_start_matches('.')
+                .strip_suffix(".udemy.com")
+                .map(str::to_string)
+        })
+        .filter(|portal| !portal.is_empty())
+        .collect();
+
+    portals
+        .iter()
+        .find(|portal| portal.as_str() != "www")
+        .or_else(|| portals.first())
+        .cloned()
+        .unwrap_or_else(|| "www".to_string())
+}
+
+pub async fn authenticate_with_netscape_cookie_file(
+    path: &std::path::Path,
+) -> anyhow::Result<UdemySession> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("Failed to read managed Udemy cookies: {}", e))?;
+    let cookies = parse_netscape_cookie_file(&contents);
+    if cookies.is_empty() {
+        return Err(anyhow!("Managed Udemy cookie file is empty"));
+    }
+    let portal = portal_from_cookie_entries(&cookies);
+    authenticate_with_cookies_only(cookies, &portal).await
+}
+
 pub async fn authenticate_with_cookies_only(
     cookies: Vec<CookieEntry>,
     portal_hint: &str,
@@ -648,4 +710,24 @@ fn decode_jwt_email(jwt: &str) -> Option<String> {
         .get("email")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_netscape_and_prefers_enterprise_portal() {
+        let input = concat!(
+            "# Netscape HTTP Cookie File\n",
+            ".udemy.com\tTRUE\t/\tTRUE\t0\tudemy_session\troot-session\n",
+            "#HttpOnly_.intuit.udemy.com\tTRUE\t/\tTRUE\t0\tdj_session_id\tportal-session\n",
+        );
+
+        let cookies = parse_netscape_cookie_file(input);
+
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[1].domain.as_deref(), Some(".intuit.udemy.com"));
+        assert_eq!(portal_from_cookie_entries(&cookies), "intuit");
+    }
 }

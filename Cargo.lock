@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "omniget-plugin-courses"
-version = "1.0.7-mpfork"
+version = "1.0.8-mpfork"
 dependencies = [
  "aes",
  "anyhow",
