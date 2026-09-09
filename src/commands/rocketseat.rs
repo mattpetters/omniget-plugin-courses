@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::platforms::rocketseat::api::{self, RocketseatCourse};
 use crate::platforms::rocketseat::downloader;
 
-
 const SESSION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const COURSES_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -18,17 +17,12 @@ struct RocketseatDownloadCompleteEvent {
     error: Option<String>,
 }
 
-
 pub async fn rocketseat_login_token(
     plugin: &crate::CoursesPlugin,
     token: String,
 ) -> Result<String, String> {
-    let _ = api::delete_saved_session().await;
-    plugin.rocketseat_session.lock().await.take();
-    *plugin.rocketseat_session_validated_at.lock().await = None;
-    *plugin.rocketseat_courses_cache.lock().await = None;
-
-    let parsed = omniget_core::core::cookie_parser::parse_cookie_input(&token, "skylab_next_access_token_v4");
+    let parsed =
+        omniget_core::core::cookie_parser::parse_cookie_input(&token, api::ACCESS_TOKEN_COOKIE);
 
     tracing::info!(
         "[rocketseat] parsed: token_len={}, cookie_count={}, cookie_string_len={}",
@@ -39,20 +33,72 @@ pub async fn rocketseat_login_token(
 
     let parsed_token = if parsed.token.is_empty() {
         let bearer = omniget_core::core::cookie_parser::parse_bearer_input(&token);
-        tracing::info!("[rocketseat] fallback to parse_bearer_input: len={}", bearer.len());
+        tracing::info!(
+            "[rocketseat] fallback to parse_bearer_input: len={}",
+            bearer.len()
+        );
         bearer
     } else {
         parsed.token
     };
 
     if parsed_token.is_empty() || parsed_token.len() < 10 {
-        return Err("Could not extract token. Paste the value of cookie 'skylab_next_access_token_v4' or the full cookie JSON.".to_string());
+        return Err(format!(
+            "Could not extract token. Paste the value of cookie '{}' or the full cookie JSON.",
+            api::ACCESS_TOKEN_COOKIE
+        ));
     }
 
-    tracing::info!("[rocketseat] using token: {}...", &parsed_token[..parsed_token.len().min(30)]);
+    login_with_token(plugin, parsed_token).await
+}
 
-    let session = api::create_session(&parsed_token)
-        .map_err(|e| format!("Failed to create session: {}", e))?;
+/// Login from a cookie payload: the browser-login webview, the Cookie
+/// Manager (extension captures) and the paste box all end up here. Accepts
+/// the JSON array the app produces, a `name=value; ...` string or a
+/// Netscape file, and only needs the access-token cookie inside it.
+pub async fn rocketseat_set_cookies(
+    plugin: &crate::CoursesPlugin,
+    cookies_json: String,
+) -> Result<String, String> {
+    let parsed = omniget_core::core::cookie_parser::parse_cookie_input(
+        &cookies_json,
+        api::ACCESS_TOKEN_COOKIE,
+    );
+    tracing::info!(
+        "[rocketseat] set_cookies: cookie_count={}, token_len={}",
+        parsed.cookies.len(),
+        parsed.token.len()
+    );
+
+    let token = parsed
+        .cookies
+        .get(api::ACCESS_TOKEN_COOKIE)
+        .cloned()
+        .unwrap_or(parsed.token);
+
+    if token.is_empty() || token.len() < 10 {
+        return Err(format!(
+            "Cookie '{}' not found. Log in at app.rocketseat.com.br and capture the cookies again.",
+            api::ACCESS_TOKEN_COOKIE
+        ));
+    }
+
+    login_with_token(plugin, token).await
+}
+
+async fn login_with_token(plugin: &crate::CoursesPlugin, token: String) -> Result<String, String> {
+    let _ = api::delete_saved_session().await;
+    plugin.rocketseat_session.lock().await.take();
+    *plugin.rocketseat_session_validated_at.lock().await = None;
+    *plugin.rocketseat_courses_cache.lock().await = None;
+
+    tracing::info!(
+        "[rocketseat] using token: {}...",
+        &token[..token.len().min(30)]
+    );
+
+    let session =
+        api::create_session(&token).map_err(|e| format!("Failed to create session: {}", e))?;
 
     match api::validate_token(&session).await {
         Ok(true) => {
@@ -62,15 +108,15 @@ pub async fn rocketseat_login_token(
             *plugin.rocketseat_session_validated_at.lock().await = Some(Instant::now());
             Ok("authenticated".to_string())
         }
-        Ok(false) => Err("Invalid token".to_string()),
+        Ok(false) => Err(
+            "Invalid or expired token. Log in again at app.rocketseat.com.br and copy a fresh one."
+                .to_string(),
+        ),
         Err(e) => Err(format!("Token validation failed: {}", e)),
     }
 }
 
-
-pub async fn rocketseat_check_session(
-    plugin: &crate::CoursesPlugin,
-) -> Result<String, String> {
+pub async fn rocketseat_check_session(plugin: &crate::CoursesPlugin) -> Result<String, String> {
     let has_memory_session = plugin.rocketseat_session.lock().await.is_some();
 
     if !has_memory_session {
@@ -121,10 +167,7 @@ pub async fn rocketseat_check_session(
     }
 }
 
-
-pub async fn rocketseat_logout(
-    plugin: &crate::CoursesPlugin,
-) -> Result<(), String> {
+pub async fn rocketseat_logout(plugin: &crate::CoursesPlugin) -> Result<(), String> {
     let _ = api::delete_saved_session().await;
     plugin.rocketseat_session.lock().await.take();
     *plugin.rocketseat_session_validated_at.lock().await = None;
@@ -153,7 +196,6 @@ async fn fetch_rocketseat_courses(
     Ok(courses)
 }
 
-
 pub async fn rocketseat_list_courses(
     plugin: &crate::CoursesPlugin,
 ) -> Result<Vec<RocketseatCourse>, String> {
@@ -168,7 +210,6 @@ pub async fn rocketseat_list_courses(
 
     fetch_rocketseat_courses(&plugin).await
 }
-
 
 pub async fn rocketseat_search_courses(
     plugin: &crate::CoursesPlugin,
@@ -192,7 +233,6 @@ pub async fn rocketseat_search_courses(
     Ok(courses)
 }
 
-
 pub async fn rocketseat_refresh_courses(
     plugin: &crate::CoursesPlugin,
 ) -> Result<Vec<RocketseatCourse>, String> {
@@ -202,7 +242,6 @@ pub async fn rocketseat_refresh_courses(
     }
     fetch_rocketseat_courses(&plugin).await
 }
-
 
 pub async fn start_rocketseat_course_download(
     host: std::sync::Arc<dyn omniget_plugin_sdk::PluginHost>,
@@ -254,20 +293,26 @@ pub async fn start_rocketseat_course_download(
         match result {
             Ok(()) => {
                 let _ = host.emit_event(
-                    "download-complete", serde_json::to_value(&RocketseatDownloadCompleteEvent {
+                    "download-complete",
+                    serde_json::to_value(&RocketseatDownloadCompleteEvent {
                         course_name: course.name,
                         success: true,
                         error: None,
-                    },).unwrap_or_default());
+                    })
+                    .unwrap_or_default(),
+                );
             }
             Err(e) => {
                 tracing::error!("[rocketseat] download error for '{}': {}", course.name, e);
                 let _ = host.emit_event(
-                    "download-complete", serde_json::to_value(&RocketseatDownloadCompleteEvent {
+                    "download-complete",
+                    serde_json::to_value(&RocketseatDownloadCompleteEvent {
                         course_name: course.name,
                         success: false,
                         error: Some(e.to_string()),
-                    },).unwrap_or_default());
+                    })
+                    .unwrap_or_default(),
+                );
             }
         }
     });

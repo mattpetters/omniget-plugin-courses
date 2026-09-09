@@ -5,8 +5,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 
 pub fn vtt_to_srt(vtt_path: &Path, srt_path: &Path) -> Result<()> {
-    let raw = fs::read_to_string(vtt_path)
-        .map_err(|e| anyhow!("read vtt failed: {}", e))?;
+    let raw = fs::read_to_string(vtt_path).map_err(|e| anyhow!("read vtt failed: {}", e))?;
     let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = normalized.split('\n').peekable();
@@ -90,8 +89,7 @@ pub fn vtt_to_srt(vtt_path: &Path, srt_path: &Path) -> Result<()> {
         output.push_str("\r\n");
     }
 
-    let mut file = fs::File::create(srt_path)
-        .map_err(|e| anyhow!("create srt failed: {}", e))?;
+    let mut file = fs::File::create(srt_path).map_err(|e| anyhow!("create srt failed: {}", e))?;
     file.write_all(output.as_bytes())
         .map_err(|e| anyhow!("write srt failed: {}", e))?;
     Ok(())
@@ -106,9 +104,7 @@ fn parse_timing(line: &str) -> Option<(String, String)> {
 }
 
 fn normalize_timestamp(ts: &str) -> Option<String> {
-    let (time_part, ms_part) = ts
-        .split_once('.')
-        .or_else(|| ts.split_once(','))?;
+    let (time_part, ms_part) = ts.split_once('.').or_else(|| ts.split_once(','))?;
     let segs: Vec<&str> = time_part.split(':').collect();
     let (h, m, s) = match segs.len() {
         3 => (segs[0], segs[1], segs[2]),

@@ -5,8 +5,10 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use omniget_core::models::media::{DownloadOptions, DownloadResult, MediaInfo, MediaType, VideoQuality};
 use crate::platforms::traits::{PlatformDownloader, ProgressUpdate};
+use omniget_core::models::media::{
+    DownloadOptions, DownloadResult, MediaInfo, MediaType, VideoQuality,
+};
 
 pub struct KiwifyDownloader;
 

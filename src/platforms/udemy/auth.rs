@@ -17,7 +17,6 @@ pub struct CookieEntry {
     pub path: Option<String>,
 }
 
-
 #[derive(Clone)]
 pub struct UdemySession {
     pub access_token: String,
@@ -42,9 +41,10 @@ fn default_portal() -> String {
 }
 
 fn session_file_path() -> anyhow::Result<PathBuf> {
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| anyhow!("Could not find app data directory"))?;
-    Ok(data_dir.join("wtf.tonho.omniget").join("udemy_session.json"))
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Could not find app data directory"))?;
+    Ok(data_dir
+        .join("wtf.tonho.omniget")
+        .join("udemy_session.json"))
 }
 
 const UDEMY_CLIENT_ID: &str = "TH96Ov3Ebo3OtgoSH5mOYzYolcowM3ycedWQDDce";
@@ -59,14 +59,8 @@ pub fn build_client_from_saved(saved: &SavedSession) -> anyhow::Result<reqwest::
 
     if !saved.access_token.is_empty() {
         let bearer = format!("Bearer {}", saved.access_token);
-        default_headers.insert(
-            "Authorization",
-            HeaderValue::from_str(&bearer)?,
-        );
-        default_headers.insert(
-            "X-Udemy-Authorization",
-            HeaderValue::from_str(&bearer)?,
-        );
+        default_headers.insert("Authorization", HeaderValue::from_str(&bearer)?);
+        default_headers.insert("X-Udemy-Authorization", HeaderValue::from_str(&bearer)?);
     }
 
     default_headers.insert(
@@ -81,10 +75,7 @@ pub fn build_client_from_saved(saved: &SavedSession) -> anyhow::Result<reqwest::
         "x-udemy-client-secret",
         HeaderValue::from_static(UDEMY_CLIENT_SECRET),
     );
-    default_headers.insert(
-        "accept-language",
-        HeaderValue::from_static("en_US"),
-    );
+    default_headers.insert("accept-language", HeaderValue::from_static("en_US"));
     default_headers.insert(
         "Referer",
         HeaderValue::from_static("https://www.udemy.com/"),
@@ -130,10 +121,7 @@ fn build_enterprise_client(saved: &SavedSession) -> anyhow::Result<reqwest::Clie
         "Accept",
         HeaderValue::from_static("application/json, text/plain, */*"),
     );
-    default_headers.insert(
-        "accept-language",
-        HeaderValue::from_static("en_US"),
-    );
+    default_headers.insert("accept-language", HeaderValue::from_static("en_US"));
 
     let client = omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -165,7 +153,11 @@ pub async fn save_session(session: &UdemySession) -> anyhow::Result<()> {
 
     let json = serde_json::to_string_pretty(&saved)?;
     std::fs::write(&path, json)?;
-    tracing::info!("[udemy] session saved for {}, {} cookies", session.email, session.cookies.len());
+    tracing::info!(
+        "[udemy] session saved for {}, {} cookies",
+        session.email,
+        session.cookies.len()
+    );
     Ok(())
 }
 
@@ -174,7 +166,11 @@ pub async fn load_saved_session() -> anyhow::Result<UdemySession> {
     let json = std::fs::read_to_string(&path)?;
     let saved: SavedSession = serde_json::from_str(&json)?;
 
-    tracing::info!("[udemy] session loaded for {}, {} cookies", saved.email, saved.cookies.len());
+    tracing::info!(
+        "[udemy] session loaded for {}, {} cookies",
+        saved.email,
+        saved.cookies.len()
+    );
 
     let client = build_client_from_saved(&saved)?;
 
@@ -197,24 +193,22 @@ pub async fn delete_saved_session() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 #[allow(dead_code)]
-const COOKIE_URIS: &[&str] = &[
-    "https://www.udemy.com",
-    "https://udemy.com",
-];
+const COOKIE_URIS: &[&str] = &["https://www.udemy.com", "https://udemy.com"];
 
 #[cfg(windows)]
 #[allow(dead_code)]
-async fn extract_webview_cookies_for_uri(
-        _uri: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    Err(anyhow!("Webview cookie extraction not available in plugin mode"))
+async fn extract_webview_cookies_for_uri(_uri: &str) -> anyhow::Result<Vec<(String, String)>> {
+    Err(anyhow!(
+        "Webview cookie extraction not available in plugin mode"
+    ))
 }
 
 #[cfg(windows)]
 #[allow(dead_code)]
-async fn extract_webview_cookies(
-    ) -> anyhow::Result<Vec<(String, String)>> {
-    Err(anyhow!("Webview cookie extraction not available in plugin mode"))
+async fn extract_webview_cookies() -> anyhow::Result<Vec<(String, String)>> {
+    Err(anyhow!(
+        "Webview cookie extraction not available in plugin mode"
+    ))
 }
 
 #[allow(dead_code)]
@@ -233,9 +227,11 @@ fn parse_document_cookie(s: &str) -> Vec<(String, String)> {
 
 #[cfg(not(windows))]
 async fn extract_webview_cookies_js(
-        _cookie_data: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    _cookie_data: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    Err(anyhow!("Webview cookie extraction not available in plugin mode"))
+    Err(anyhow!(
+        "Webview cookie extraction not available in plugin mode"
+    ))
 }
 
 fn strip_cookie_quotes(value: &str) -> &str {
@@ -273,7 +269,11 @@ pub async fn request_otp(email: &str) -> anyhow::Result<()> {
 
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("OTP request failed ({}): {}", status, &body[..body.len().min(300)]));
+        return Err(anyhow!(
+            "OTP request failed ({}): {}",
+            status,
+            &body[..body.len().min(300)]
+        ));
     }
 
     tracing::info!("[udemy] OTP sent to {}", email);
@@ -305,13 +305,19 @@ pub async fn verify_otp(email: &str, otp_code: &str) -> anyhow::Result<UdemySess
         .map_err(|e| anyhow!("OTP verification request failed: {}", e))?;
 
     let status = resp.status();
-    let body_text = resp.text().await
+    let body_text = resp
+        .text()
+        .await
         .map_err(|e| anyhow!("Failed to read verify response: {}", e))?;
 
     tracing::info!("[udemy] OTP verify response: {}", status);
 
     if !status.is_success() {
-        return Err(anyhow!("OTP verification failed ({}): {}", status, &body_text[..body_text.len().min(300)]));
+        return Err(anyhow!(
+            "OTP verification failed ({}): {}",
+            status,
+            &body_text[..body_text.len().min(300)]
+        ));
     }
 
     let body: serde_json::Value = serde_json::from_str(&body_text)
@@ -371,10 +377,13 @@ pub async fn authenticate_with_cookie_json(cookie_json_str: &str) -> anyhow::Res
         CookieArray(Vec<CookieEntry>),
     }
 
-    tracing::info!("[udemy] authenticate_with_cookie_json: json size={}", cookie_json_str.len());
+    tracing::info!(
+        "[udemy] authenticate_with_cookie_json: json size={}",
+        cookie_json_str.len()
+    );
 
-    let input: CookieInput = serde_json::from_str(cookie_json_str)
-        .map_err(|e| anyhow!("Invalid cookie JSON: {}", e))?;
+    let input: CookieInput =
+        serde_json::from_str(cookie_json_str).map_err(|e| anyhow!("Invalid cookie JSON: {}", e))?;
 
     let export = match input {
         CookieInput::Export(export) => export,
@@ -399,8 +408,7 @@ pub async fn authenticate_with_cookie_json(cookie_json_str: &str) -> anyhow::Res
             .filter_map(|c| c.domain.as_deref())
             .find_map(|d| {
                 let d = d.trim_start_matches('.');
-                d.strip_suffix(".udemy.com")
-                    .map(|sub| sub.to_string())
+                d.strip_suffix(".udemy.com").map(|sub| sub.to_string())
             })
             .unwrap_or_else(|| "www".into())
     };
@@ -428,7 +436,9 @@ pub async fn authenticate_with_cookie_json(cookie_json_str: &str) -> anyhow::Res
         .find(|(name, _)| name == "ud_user_jwt")
         .and_then(|(_, value)| decode_jwt_email(value))
         .unwrap_or_else(|| {
-            tracing::info!("[udemy] JWT email decode failed or ud_user_jwt not found, using fallback email");
+            tracing::info!(
+                "[udemy] JWT email decode failed or ud_user_jwt not found, using fallback email"
+            );
             format!("enterprise@{}.udemy.com", portal_name)
         });
 
@@ -535,10 +545,18 @@ pub async fn authenticate_with_cookies_only(
     let has_session = cookies.iter().any(|c| c.name == "udemy_session");
     let has_dj = cookies.iter().any(|c| c.name == "dj_session_id");
     if !has_session && !has_dj {
-        return Err(anyhow!("Missing session cookies (udemy_session/dj_session_id)"));
+        let names: Vec<&str> = cookies.iter().map(|c| c.name.as_str()).collect();
+        tracing::warn!("[udemy] no session cookie among {:?}", names);
+        return Err(anyhow!(
+            "No Udemy session cookie was captured (access_token, udemy_session or dj_session_id). These are HttpOnly, so the login window must read them from the browser's cookie store; make sure OmniGet is up to date, or use the cookie-file login instead"
+        ));
     }
 
-    let portal_name = if portal_hint.is_empty() { "www" } else { portal_hint };
+    let portal_name = if portal_hint.is_empty() {
+        "www"
+    } else {
+        portal_hint
+    };
     let base = format!("https://{}.udemy.com", portal_name);
     let base_url: reqwest::Url = base
         .parse()
@@ -569,10 +587,7 @@ pub async fn authenticate_with_cookies_only(
         "x-udemy-client-secret",
         HeaderValue::from_static(UDEMY_CLIENT_SECRET),
     );
-    default_headers.insert(
-        "accept-language",
-        HeaderValue::from_static("en_US"),
-    );
+    default_headers.insert("accept-language", HeaderValue::from_static("en_US"));
 
     let validation_client = omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -634,7 +649,13 @@ pub async fn authenticate_with_cookies_only(
             if !display_name.is_empty() {
                 let slug: String = display_name
                     .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
                     .collect();
                 format!("{}@{}.udemy.com", slug, portal_name)
             } else if let Some(id) = user_id {
@@ -684,10 +705,7 @@ fn detect_portal_from_url(url: &str) -> String {
     url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .and_then(|host| {
-            host.strip_suffix(".udemy.com")
-                .map(|sub| sub.to_string())
-        })
+        .and_then(|host| host.strip_suffix(".udemy.com").map(|sub| sub.to_string()))
         .unwrap_or_else(|| "www".into())
 }
 

@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 1.1.0-mpfork-0.1
+
+- Merge upstream 1.1.0, including Rocketseat, Meta-Analysis Academy, Hotmart OIDC, section selection, and detailed lecture outcomes.
+- Preserve managed Udemy session recovery, persisted download settings, paginated enrollment, Widevine downloads, and course-ID completion events.
+- Return both raw curriculum chapters for existing automation and section summaries for the updated app.
+- Fail incomplete courses explicitly while retaining successfully downloaded lectures for retries.
+- Build against the matching customized OmniGet core and Rust 1.97.0.
+
+## Earlier fork changes
 
 <!-- git-changelog-on-commit: 9795691f1eb2f1497ac9b2ee12959e5f00c1dac0 -->
 ### Changed

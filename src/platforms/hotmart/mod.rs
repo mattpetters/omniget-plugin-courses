@@ -1,4 +1,6 @@
-pub mod auth;
 pub mod api;
-pub mod parser;
+pub mod auth;
+pub mod course_list;
 pub mod downloader;
+pub mod oidc;
+pub mod parser;

@@ -6,15 +6,12 @@ use tokio_util::sync::CancellationToken;
 use crate::platforms::hotmart::api::Course;
 use crate::platforms::hotmart::downloader::HotmartDownloader;
 
-
-
 #[derive(Clone, Serialize)]
 struct DownloadCompleteEvent {
     course_name: String,
     success: bool,
     error: Option<String>,
 }
-
 
 pub async fn start_course_download(
     host: std::sync::Arc<dyn omniget_plugin_sdk::PluginHost>,
@@ -55,7 +52,10 @@ pub async fn start_course_download(
         let host_clone = host.clone();
         let progress_forwarder = tokio::spawn(async move {
             while let Some(progress) = rx.recv().await {
-                let _ = host_clone.emit_event("download-progress", serde_json::to_value(&progress).unwrap_or_default());
+                let _ = host_clone.emit_event(
+                    "download-progress",
+                    serde_json::to_value(&progress).unwrap_or_default(),
+                );
             }
         });
 
@@ -73,27 +73,32 @@ pub async fn start_course_download(
         match result {
             Ok(()) => {
                 let _ = host.emit_event(
-                    "download-complete", serde_json::to_value(&DownloadCompleteEvent {
+                    "download-complete",
+                    serde_json::to_value(&DownloadCompleteEvent {
                         course_name: course.name,
                         success: true,
                         error: None,
-                    },).unwrap_or_default());
+                    })
+                    .unwrap_or_default(),
+                );
             }
             Err(e) => {
                 tracing::error!("Download error for '{}': {}", course.name, e);
                 let _ = host.emit_event(
-                    "download-complete", serde_json::to_value(&DownloadCompleteEvent {
+                    "download-complete",
+                    serde_json::to_value(&DownloadCompleteEvent {
                         course_name: course.name,
                         success: false,
                         error: Some(e.to_string()),
-                    },).unwrap_or_default());
+                    })
+                    .unwrap_or_default(),
+                );
             }
         }
     });
 
     Ok(format!("Download started: {}", course_name))
 }
-
 
 pub async fn cancel_course_download(
     plugin: &crate::CoursesPlugin,
@@ -109,10 +114,7 @@ pub async fn cancel_course_download(
     }
 }
 
-
-pub async fn get_active_downloads(
-    plugin: &crate::CoursesPlugin,
-) -> Result<Vec<u64>, String> {
+pub async fn get_active_downloads(plugin: &crate::CoursesPlugin) -> Result<Vec<u64>, String> {
     let map = plugin.active_downloads.lock().await;
     Ok(map.keys().copied().collect())
 }

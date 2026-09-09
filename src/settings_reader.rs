@@ -22,12 +22,19 @@ pub fn load_app_settings() -> AppSettings {
                 settings
             }
             Err(e) => {
-                tracing::warn!("[settings] failed to parse {}: {}, using defaults", path.display(), e);
+                tracing::warn!(
+                    "[settings] failed to parse {}: {}, using defaults",
+                    path.display(),
+                    e
+                );
                 AppSettings::default()
             }
         },
         Err(_) => {
-            tracing::info!("[settings] no settings file at {}, using defaults", path.display());
+            tracing::info!(
+                "[settings] no settings file at {}, using defaults",
+                path.display()
+            );
             AppSettings::default()
         }
     }
@@ -55,6 +62,9 @@ mod tests {
         let expected = AppSettings::default();
         let parsed = parse_app_settings(&serde_json::to_string(&expected).unwrap()).unwrap();
 
-        assert_eq!(parsed.download.video_quality, expected.download.video_quality);
+        assert_eq!(
+            parsed.download.video_quality,
+            expected.download.video_quality
+        );
     }
 }

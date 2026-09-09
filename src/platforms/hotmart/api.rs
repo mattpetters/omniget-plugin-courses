@@ -3,6 +3,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use super::auth::HotmartSession;
+use super::course_list;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Course {
@@ -16,6 +17,10 @@ pub struct Course {
     pub image_url: Option<String>,
     pub category: Option<String>,
     pub external_platform: bool,
+    #[serde(default)]
+    pub external_url: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,11 +84,16 @@ pub struct AttachmentInfo {
 pub struct SubdomainInfo {
     pub product_id: u64,
     pub subdomain: String,
+    pub name: Option<String>,
+    pub roles: Vec<String>,
 }
 
 pub fn navigation_headers(token: &str, slug: &str, product_id: u64) -> anyhow::Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    headers.insert("Accept", HeaderValue::from_static("application/json, text/plain, */*"));
+    headers.insert(
+        "Accept",
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
     headers.insert(
         "Authorization",
         HeaderValue::from_str(&format!("Bearer {}", token))
@@ -98,8 +108,11 @@ pub fn navigation_headers(token: &str, slug: &str, product_id: u64) -> anyhow::R
         HeaderValue::from_str(slug)
             .map_err(|e| anyhow!("Invalid slug for header '{}': {}", slug, e))?,
     );
-    headers.insert("x-product-id", HeaderValue::from_str(&product_id.to_string())
-        .map_err(|e| anyhow!("Invalid product_id for header: {}", e))?);
+    headers.insert(
+        "x-product-id",
+        HeaderValue::from_str(&product_id.to_string())
+            .map_err(|e| anyhow!("Invalid product_id for header: {}", e))?,
+    );
     Ok(headers)
 }
 
@@ -115,41 +128,104 @@ pub async fn get_subdomains(session: &HotmartSession) -> anyhow::Result<Vec<Subd
     let body_text = resp.text().await?;
 
     if !status.is_success() {
-        return Err(anyhow!("check_token retornou status {}: {}", status, &body_text[..500.min(body_text.len())]));
+        return Err(anyhow!(
+            "check_token retornou status {}: {}",
+            status,
+            &body_text[..500.min(body_text.len())]
+        ));
     }
 
     let body: serde_json::Value = serde_json::from_str(&body_text)?;
 
-    let resources = body
-        .get("resources")
-        .and_then(|r| r.as_array())
-        .ok_or_else(|| anyhow!("Field 'resources' not found in check_token"))?;
-
-    let mut subdomains = Vec::new();
-    for res in resources {
-        let resource = match res.get("resource") {
-            Some(r) => r,
-            None => continue,
-        };
-        let product_id = resource
-            .get("productId")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let subdomain = resource
-            .get("subdomain")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if product_id > 0 && !subdomain.is_empty() {
-            subdomains.push(SubdomainInfo {
-                product_id,
-                subdomain,
-            });
-        }
+    if body.get("resources").and_then(|r| r.as_array()).is_none() {
+        tracing::warn!(
+            "[hotmart] check_token has no 'resources' array; top-level keys: {:?}",
+            course_list::top_level_keys(&body)
+        );
+        return Err(anyhow!("Field 'resources' not found in check_token"));
     }
 
-    Ok(subdomains)
+    Ok(course_list::parse_check_token_resources(&body))
+}
+
+const PURCHASES_V2: &str = "https://api-hub.cb.hotmart.com/club-drive-api/rest/v2/purchase/";
+/// Products the user got for free (gifted by the creator, free sign-ups) are
+/// listed by a sibling endpoint, not among the purchases (#303, #305).
+const PURCHASES_FREE_V1: &str =
+    "https://api-hub.cb.hotmart.com/club-drive-api/rest/v1/purchase/free/";
+const MAX_PAGES: u32 = 20;
+
+async fn fetch_purchase_page(
+    session: &HotmartSession,
+    base: &str,
+    page: u32,
+    label: &str,
+) -> anyhow::Result<(Vec<Course>, usize)> {
+    let url = format!("{base}?archived=UNARCHIVED&page={page}");
+    let resp = session.client.get(&url).send().await?;
+    let status = resp.status();
+    let body_text = resp.text().await?;
+
+    if !status.is_success() {
+        tracing::error!(
+            "[hotmart] {} page {} failed: status={}, body={}",
+            label,
+            page,
+            status,
+            &body_text[..body_text.len().min(500)]
+        );
+        return Err(anyhow!("API returned status {}", status));
+    }
+
+    let body: serde_json::Value = serde_json::from_str(&body_text)?;
+    let page_size = body
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+        .unwrap_or(usize::MAX as u64) as usize;
+
+    match course_list::parse_course_list(&body) {
+        Ok(parsed) => {
+            tracing::info!(
+                "[hotmart] {} page {}: {} entries parsed from '{}'",
+                label,
+                page,
+                parsed.courses.len(),
+                parsed.container
+            );
+            Ok((parsed.courses, page_size))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[hotmart] {}: unrecognised response; top-level keys: {:?}; shape: {}",
+                label,
+                e.top_level_keys,
+                e.shape
+            );
+            Err(anyhow!(e))
+        }
+    }
+}
+
+async fn fetch_all_pages(
+    session: &HotmartSession,
+    base: &str,
+    label: &str,
+) -> anyhow::Result<Vec<Course>> {
+    let mut all: Vec<Course> = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let (courses, page_size) = fetch_purchase_page(session, base, page, label).await?;
+        let got = courses.len();
+        for c in courses {
+            if !all.iter().any(|existing| existing.id == c.id) {
+                all.push(c);
+            }
+        }
+        if got == 0 || got < page_size {
+            break;
+        }
+    }
+    Ok(all)
 }
 
 pub async fn list_courses(session: &HotmartSession) -> anyhow::Result<Vec<Course>> {
@@ -159,84 +235,26 @@ pub async fn list_courses(session: &HotmartSession) -> anyhow::Result<Vec<Course
         session.cookies.len(),
         session.email
     );
+    fetch_all_pages(session, PURCHASES_V2, "purchases").await
+}
 
-    let resp = session
-        .client
-        .get("https://api-hub.cb.hotmart.com/club-drive-api/rest/v2/purchase/?archived=UNARCHIVED")
-        .send()
-        .await?;
-
-    let status = resp.status();
-    let body_text = resp.text().await?;
-
-    if !status.is_success() {
-        tracing::error!(
-            "[hotmart] list_courses failed: status={}, body={}",
-            status,
-            &body_text[..body_text.len().min(500)]
-        );
-        return Err(anyhow!("API returned status {}", status));
+pub async fn list_free_courses(session: &HotmartSession) -> anyhow::Result<Vec<Course>> {
+    let mut courses = fetch_all_pages(session, PURCHASES_FREE_V1, "free products").await?;
+    for c in &mut courses {
+        c.source = Some("free".into());
     }
-
-    let body: serde_json::Value = serde_json::from_str(&body_text)?;
-
-    let purchases = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .or_else(|| body.get("purchases").and_then(|p| p.as_array()))
-        .or_else(|| body.as_array())
-        .ok_or_else(|| anyhow!("Formato inesperado na resposta de cursos: sem campo 'data', 'purchases' ou array raiz"))?;
-
-    let mut courses = Vec::new();
-    for p in purchases {
-        let product = p.get("product").unwrap_or(p);
-
-        let id = product.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let name = product.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-        let seller = product
-            .get("seller")
-            .and_then(|s| s.get("name").and_then(|n| n.as_str()))
-            .or_else(|| {
-                p.get("producer")
-                    .or_else(|| p.get("seller"))
-                    .and_then(|s| s.get("name").and_then(|n| n.as_str()))
-            })
-            .unwrap_or("")
-            .to_string();
-
-        let slug = product
-            .get("hotmartClub")
-            .and_then(|hc| hc.get("slug").and_then(|s| s.as_str()))
-            .map(String::from);
-
-        let is_hotmart_club = slug.is_some()
-            || p.get("accessRights")
-                .and_then(|a| a.get("hasClubAccess"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-        let category = product.get("category").and_then(|v| v.as_str()).map(String::from);
-        let image_url = product.get("picture").and_then(|v| v.as_str()).map(String::from);
-
-        courses.push(Course {
-            id,
-            name,
-            slug,
-            seller,
-            subdomain: None,
-            is_hotmart_club,
-            price: None,
-            image_url,
-            category,
-            external_platform: false,
-        });
-    }
-
     Ok(courses)
 }
 
-pub async fn get_course_price(session: &HotmartSession, product_id: u64) -> anyhow::Result<f64> {
+pub use course_list::ProductDetails;
+
+/// `purchase/products/{id}`: price, and the fields the list omits — the club
+/// slug and the `membership.registerAddress` that tells us when the content
+/// lives on another platform (MemberKit, Kiwify…).
+pub async fn get_course_details(
+    session: &HotmartSession,
+    product_id: u64,
+) -> anyhow::Result<ProductDetails> {
     let url = format!(
         "https://api-hub.cb.hotmart.com/club-drive-api/rest/v2/purchase/products/{}",
         product_id
@@ -246,21 +264,11 @@ pub async fn get_course_price(session: &HotmartSession, product_id: u64) -> anyh
 
     let status = resp.status();
     if !status.is_success() {
-        return Err(anyhow!("Price not available (status {})", status));
+        return Err(anyhow!("Product details not available (status {})", status));
     }
 
     let body: serde_json::Value = resp.json().await?;
-
-    let price = body
-        .get("purchases")
-        .and_then(|p| p.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|purchase| purchase.get("value"))
-        .and_then(|v| v.as_f64())
-        .or_else(|| body.get("value").and_then(|v| v.as_f64()))
-        .unwrap_or(0.0);
-
-    Ok(price)
+    Ok(course_list::parse_product_details(&body))
 }
 
 pub fn merge_subdomains(courses: &mut [Course], subdomains: &[SubdomainInfo]) {
@@ -294,7 +302,11 @@ pub async fn get_modules(
     let body_text = resp.text().await?;
 
     if !status.is_success() {
-        return Err(anyhow!("get_modules retornou status {}: {}", status, &body_text[..500.min(body_text.len())]));
+        return Err(anyhow!(
+            "get_modules retornou status {}: {}",
+            status,
+            &body_text[..500.min(body_text.len())]
+        ));
     }
 
     let body: serde_json::Value = serde_json::from_str(&body_text)?;
@@ -315,7 +327,11 @@ pub async fn get_modules(
                 _ => String::new(),
             })
             .unwrap_or_default();
-        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = m
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let pages_json = m
             .get("pages")
@@ -326,8 +342,16 @@ pub async fn get_modules(
         let pages = pages_json
             .iter()
             .map(|p| PageInfo {
-                hash: p.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                name: p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                hash: p
+                    .get("hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: p
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 page_type: p
                     .get("type")
                     .or_else(|| p.get("pageType"))
@@ -363,7 +387,11 @@ pub async fn get_lesson(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("get_lesson retornou status {}: {}", status, &body_text[..500.min(body_text.len())]));
+        return Err(anyhow!(
+            "get_lesson retornou status {}: {}",
+            status,
+            &body_text[..500.min(body_text.len())]
+        ));
     }
 
     let body: serde_json::Value = resp.json().await?;
@@ -372,10 +400,24 @@ pub async fn get_lesson(
         return Err(anyhow!("Lesson unavailable: {}", msg));
     }
 
-    let hash = body.get("hash").and_then(|v| v.as_str()).unwrap_or(page_hash).to_string();
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let content = body.get("content").and_then(|v| v.as_str()).map(String::from);
-    let locked = body.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+    let hash = body
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or(page_hash)
+        .to_string();
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let locked = body
+        .get("locked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let has_media = body
         .get("hasMedia")
@@ -392,22 +434,26 @@ pub async fn get_lesson(
         .map(|arr| {
             arr.iter()
                 .map(|m| LessonMedia {
-                    name: m.get("name")
+                    name: m
+                        .get("name")
                         .or_else(|| m.get("mediaName"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    code: m.get("code")
+                    code: m
+                        .get("code")
                         .or_else(|| m.get("mediaCode"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    url: m.get("url")
+                    url: m
+                        .get("url")
                         .or_else(|| m.get("mediaSrcUrl"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    media_type: m.get("type")
+                    media_type: m
+                        .get("type")
                         .or_else(|| m.get("mediaType"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
@@ -433,7 +479,11 @@ pub async fn get_lesson(
                             _ => String::new(),
                         })
                         .unwrap_or_default(),
-                    file_name: a.get("fileName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    file_name: a
+                        .get("fileName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 })
                 .collect()
         })
@@ -445,11 +495,13 @@ pub async fn get_lesson(
         .map(|arr| {
             arr.iter()
                 .map(|r| ReadingLink {
-                    title: r.get("articleName")
+                    title: r
+                        .get("articleName")
                         .or_else(|| r.get("title"))
                         .and_then(|v| v.as_str())
                         .map(String::from),
-                    url: r.get("articleUrl")
+                    url: r
+                        .get("articleUrl")
                         .or_else(|| r.get("url"))
                         .and_then(|v| v.as_str())
                         .map(String::from),
@@ -498,9 +550,15 @@ pub async fn get_attachment_url(
         .unwrap_or("")
         .to_string();
 
-    let file_name = body.get("fileName").and_then(|v| v.as_str()).map(String::from);
+    let file_name = body
+        .get("fileName")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let token = body.get("token").and_then(|v| v.as_str()).map(String::from);
-    let lambda_url = body.get("lambdaUrl").and_then(|v| v.as_str()).map(String::from);
+    let lambda_url = body
+        .get("lambdaUrl")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     Ok(AttachmentInfo {
         url: download_url,

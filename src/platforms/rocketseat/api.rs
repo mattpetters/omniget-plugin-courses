@@ -9,6 +9,9 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const BASE_URL: &str = "https://app.rocketseat.com.br";
 const API_URL: &str = "https://skylab-api.rocketseat.com.br";
 const BUNNY_LIBRARY_ID: &str = "212524";
+/// Cookie the Next.js app keeps the JWT in. The API takes it as a Bearer
+/// header, the app pages (RSC) only read it from the cookie jar.
+pub const ACCESS_TOKEN_COOKIE: &str = "skylab_next_access_token_v4";
 
 #[derive(Clone)]
 pub struct RocketseatSession {
@@ -28,6 +31,14 @@ pub struct RocketseatCourse {
     pub name: String,
     pub slug: String,
     pub description: Option<String>,
+    /// Whether the logged-in account can open the lessons. Missing in
+    /// older payloads, so it defaults to `true` to keep those downloadable.
+    #[serde(default = "default_true")]
+    pub has_access: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,13 +67,17 @@ fn build_client(token: &str) -> anyhow::Result<reqwest::Client> {
         HeaderValue::from_str(&format!("Bearer {}", token))?,
     );
     headers.insert("Accept", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "Origin",
-        HeaderValue::from_static(BASE_URL),
-    );
+    headers.insert("Origin", HeaderValue::from_static(BASE_URL));
     headers.insert(
         "Referer",
         HeaderValue::from_static("https://app.rocketseat.com.br/"),
+    );
+    // app.rocketseat.com.br ignores the Authorization header and reads the
+    // session from the cookie, so the RSC pages (`/jornada/...`) only reflect
+    // the account's access when the token also travels as a cookie.
+    headers.insert(
+        "Cookie",
+        HeaderValue::from_str(&format!("{}={}", ACCESS_TOKEN_COOKIE, token))?,
     );
 
     let client = omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
@@ -77,9 +92,10 @@ fn build_client(token: &str) -> anyhow::Result<reqwest::Client> {
 }
 
 fn session_file_path() -> anyhow::Result<PathBuf> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| anyhow!("Could not find app data directory"))?;
-    Ok(data_dir.join("wtf.tonho.omniget").join("rocketseat_session.json"))
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Could not find app data directory"))?;
+    Ok(data_dir
+        .join("wtf.tonho.omniget")
+        .join("rocketseat_session.json"))
 }
 
 pub fn create_session(token: &str) -> anyhow::Result<RocketseatSession> {
@@ -91,10 +107,13 @@ pub fn create_session(token: &str) -> anyhow::Result<RocketseatSession> {
 }
 
 pub async fn validate_token(session: &RocketseatSession) -> anyhow::Result<bool> {
+    // `/v2/search/multi-search` (the old probe) is public and answers 200 to
+    // any token, so it never caught an expired or mistyped JWT. The
+    // notifications counter is per-user: 200 with a valid token, 401 with
+    // `E_INVALID_JWT_TOKEN` otherwise.
     let resp = session
         .client
-        .get(&format!("{}/v2/search/multi-search", API_URL))
-        .query(&[("query", "test"), ("page", "1")])
+        .get(&format!("{}/v2/notifications/me/count", API_URL))
         .header("Host", "skylab-api.rocketseat.com.br")
         .send()
         .await?;
@@ -102,7 +121,18 @@ pub async fn validate_token(session: &RocketseatSession) -> anyhow::Result<bool>
     let status = resp.status();
     tracing::info!("[rocketseat] validate_token status={}", status);
 
-    Ok(status.is_success())
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "validate_token returned status {}: {}",
+            status,
+            &body[..body.len().min(200)]
+        ));
+    }
+    Ok(true)
 }
 
 pub async fn search_courses(
@@ -180,11 +210,17 @@ pub async fn search_courses(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            let has_access = item
+                .get("has_access")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
             all_courses.push(RocketseatCourse {
                 id,
                 name,
                 slug,
                 description,
+                has_access,
             });
         }
 
@@ -207,10 +243,14 @@ pub async fn search_courses(
     Ok(all_courses)
 }
 
-pub async fn list_courses(
-    session: &RocketseatSession,
-) -> anyhow::Result<Vec<RocketseatCourse>> {
-    search_courses(session, "rocketseat").await
+pub async fn list_courses(session: &RocketseatSession) -> anyhow::Result<Vec<RocketseatCourse>> {
+    // An empty query makes multi-search page through the whole catalog;
+    // searching for "rocketseat" only returned the three journeys with that
+    // word in the title.
+    let mut courses = search_courses(session, "").await?;
+    // Journeys the account can open first, then the rest of the catalog.
+    courses.sort_by_key(|c| !c.has_access);
+    Ok(courses)
 }
 
 fn parse_rsc_response(text: &str) -> serde_json::Value {
@@ -293,10 +333,7 @@ pub async fn get_course_content(
             .unwrap_or_else(|| vec![node.clone()]);
 
         for sub in &sub_contents {
-            let module_slug = sub
-                .get("slug")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let module_slug = sub.get("slug").and_then(|v| v.as_str()).unwrap_or("");
 
             if module_slug.is_empty() {
                 continue;
@@ -402,9 +439,7 @@ async fn fetch_module_lessons(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            let duration = lesson
-                .get("duration")
-                .and_then(|v| v.as_i64());
+            let duration = lesson.get("duration").and_then(|v| v.as_i64());
 
             lessons.push(RocketseatLesson {
                 id,

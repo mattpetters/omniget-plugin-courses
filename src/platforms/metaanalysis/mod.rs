@@ -10,31 +10,32 @@ use omniget_core::models::media::{
     DownloadOptions, DownloadResult, MediaInfo, MediaType, VideoQuality,
 };
 
-pub struct RocketseatDownloader;
+pub struct MetaAnalysisDownloader;
 
-impl Default for RocketseatDownloader {
+impl Default for MetaAnalysisDownloader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RocketseatDownloader {
+impl MetaAnalysisDownloader {
     pub fn new() -> Self {
         Self
     }
 }
 
 #[async_trait]
-impl PlatformDownloader for RocketseatDownloader {
+impl PlatformDownloader for MetaAnalysisDownloader {
     fn name(&self) -> &str {
-        "rocketseat"
+        "metaanalysis"
     }
 
     fn can_handle(&self, url: &str) -> bool {
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
                 let host = host.to_lowercase();
-                return host == "rocketseat.com.br" || host == "app.rocketseat.com.br";
+                return host == "metaanalysisacademy.com"
+                    || host.ends_with(".metaanalysisacademy.com");
             }
         }
         false
@@ -42,13 +43,13 @@ impl PlatformDownloader for RocketseatDownloader {
 
     async fn get_media_info(&self, url: &str) -> anyhow::Result<MediaInfo> {
         Ok(MediaInfo {
-            title: "Rocketseat".to_string(),
+            title: "Meta-Analysis Academy Course".to_string(),
             author: String::new(),
-            platform: "rocketseat".to_string(),
+            platform: "metaanalysis".to_string(),
             duration_seconds: None,
             thumbnail_url: None,
             available_qualities: vec![VideoQuality {
-                label: "Original".to_string(),
+                label: "course".to_string(),
                 width: 0,
                 height: 0,
                 url: url.to_string(),
@@ -66,7 +67,7 @@ impl PlatformDownloader for RocketseatDownloader {
         _progress: mpsc::Sender<ProgressUpdate>,
     ) -> anyhow::Result<DownloadResult> {
         Err(anyhow!(
-            "Use the courses interface to download from Rocketseat"
+            "Use the courses interface to download Meta-Analysis Academy courses"
         ))
     }
 }

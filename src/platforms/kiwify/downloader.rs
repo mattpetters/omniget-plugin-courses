@@ -61,7 +61,8 @@ pub async fn download_full_course(
     let completed = Arc::new(AtomicUsize::new(0));
 
     let _ = host.emit_event(
-        "download-progress", serde_json::to_value(&KiwifyCourseDownloadProgress {
+        "download-progress",
+        serde_json::to_value(&KiwifyCourseDownloadProgress {
             course_id: course.id.clone(),
             course_name: course.name.clone(),
             percent: 0.0,
@@ -72,7 +73,9 @@ pub async fn download_full_course(
             completed_lessons: 0,
             total_modules: total_modules as u32,
             current_module_index: 0,
-        },).unwrap_or_default());
+        })
+        .unwrap_or_default(),
+    );
 
     for (mi, module) in modules.iter().enumerate() {
         if cancel_token.is_cancelled() {
@@ -102,7 +105,8 @@ pub async fn download_full_course(
                     );
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let _ = host.emit_event(
-                        "download-progress", serde_json::to_value(&KiwifyCourseDownloadProgress {
+                        "download-progress",
+                        serde_json::to_value(&KiwifyCourseDownloadProgress {
                             course_id: course.id.clone(),
                             course_name: course.name.clone(),
                             percent: done as f64 / total_lessons as f64 * 100.0,
@@ -113,13 +117,17 @@ pub async fn download_full_course(
                             completed_lessons: done as u32,
                             total_modules: total_modules as u32,
                             current_module_index: (mi + 1) as u32,
-                        },).unwrap_or_default());
+                        })
+                        .unwrap_or_default(),
+                    );
                     continue;
                 }
             };
 
             if let Some(ref desc) = detail.description {
-                omniget_core::core::course_utils::save_description(&lesson_dir, desc, "html").await.ok();
+                omniget_core::core::course_utils::save_description(&lesson_dir, desc, "html")
+                    .await
+                    .ok();
             }
 
             if let Some(ref video_url) = detail.video_url {
@@ -140,13 +148,8 @@ pub async fn download_full_course(
                         .unwrap_or("mp4")
                 };
 
-                let video_path = format!(
-                    "{}/{}. {}.{}",
-                    lesson_dir,
-                    li + 1,
-                    lesson_name,
-                    video_ext
-                );
+                let video_path =
+                    format!("{}/{}. {}.{}", lesson_dir, li + 1, lesson_name, video_ext);
 
                 if std::path::Path::new(&video_path).exists() {
                     let meta = std::fs::metadata(&video_path);
@@ -154,7 +157,8 @@ pub async fn download_full_course(
                         tracing::info!("[kiwify] Skipping existing: {}", video_path);
                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                         let _ = host.emit_event(
-                            "download-progress", serde_json::to_value(&KiwifyCourseDownloadProgress {
+                            "download-progress",
+                            serde_json::to_value(&KiwifyCourseDownloadProgress {
                                 course_id: course.id.clone(),
                                 course_name: course.name.clone(),
                                 percent: done as f64 / total_lessons as f64 * 100.0,
@@ -165,7 +169,9 @@ pub async fn download_full_course(
                                 completed_lessons: done as u32,
                                 total_modules: total_modules as u32,
                                 current_module_index: (mi + 1) as u32,
-                            },).unwrap_or_default());
+                            })
+                            .unwrap_or_default(),
+                        );
                         continue;
                     }
                 }
@@ -195,7 +201,14 @@ pub async fn download_full_course(
                                 lesson.name,
                                 e
                             );
-                            match download_file_direct(&session.client, video_url, &video_path, &cancel_token).await {
+                            match download_file_direct(
+                                &session.client,
+                                video_url,
+                                &video_path,
+                                &cancel_token,
+                            )
+                            .await
+                            {
                                 Ok(size) => {
                                     total_bytes.fetch_add(size, Ordering::Relaxed);
                                 }
@@ -243,23 +256,27 @@ pub async fn download_full_course(
                     }
                 };
 
-                match download_file_direct(&session.client, &download_url, &file_path, &cancel_token).await {
+                match download_file_direct(
+                    &session.client,
+                    &download_url,
+                    &file_path,
+                    &cancel_token,
+                )
+                .await
+                {
                     Ok(size) => {
                         total_bytes.fetch_add(size, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "[kiwify] File download failed for '{}': {}",
-                            file.name,
-                            e
-                        );
+                        tracing::error!("[kiwify] File download failed for '{}': {}", file.name, e);
                     }
                 }
             }
 
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = host.emit_event(
-                "download-progress", serde_json::to_value(&KiwifyCourseDownloadProgress {
+                "download-progress",
+                serde_json::to_value(&KiwifyCourseDownloadProgress {
                     course_id: course.id.clone(),
                     course_name: course.name.clone(),
                     percent: done as f64 / total_lessons as f64 * 100.0,
@@ -270,7 +287,9 @@ pub async fn download_full_course(
                     completed_lessons: done as u32,
                     total_modules: total_modules as u32,
                     current_module_index: (mi + 1) as u32,
-                },).unwrap_or_default());
+                })
+                .unwrap_or_default(),
+            );
         }
     }
 
@@ -278,7 +297,9 @@ pub async fn download_full_course(
         return Err(anyhow!("Download cancelled by user"));
     }
 
-    omniget_core::core::course_utils::mark_course_complete(&course_dir).await.ok();
+    omniget_core::core::course_utils::mark_course_complete(&course_dir)
+        .await
+        .ok();
 
     Ok(())
 }
@@ -331,7 +352,6 @@ async fn download_with_ytdlp(
         false,
         &[],
         None,
-        false,
     )
     .await?;
 
@@ -347,12 +367,6 @@ async fn download_file_direct(
     let out = Path::new(output_path);
     let (tx, _rx) = mpsc::channel(8);
 
-    omniget_core::core::direct_downloader::download_direct(
-        client,
-        url,
-        out,
-        tx,
-        Some(cancel_token),
-    )
-    .await
+    omniget_core::core::direct_downloader::download_direct(client, url, out, tx, Some(cancel_token))
+        .await
 }

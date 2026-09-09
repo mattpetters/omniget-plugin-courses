@@ -1,4 +1,3 @@
-
 use serde::Serialize;
 
 use tokio::sync::mpsc;
@@ -7,15 +6,33 @@ use tokio_util::sync::CancellationToken;
 use crate::platforms::udemy::api::{self, UdemyCourse, UdemyCurriculum};
 use crate::platforms::udemy::downloader::UdemyDownloader;
 
-
-
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Default)]
 struct UdemyDownloadCompleteEvent {
     course_id: u64,
     course_name: String,
     success: bool,
     error: Option<String>,
     drm_skipped: u32,
+    videos_downloaded: u32,
+    videos_already_present: u32,
+    no_media: u32,
+    failed: u32,
+    lectures_processed: u32,
+    skipped: UdemySkippedLectures,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct UdemySkippedLectures {
+    drm: Vec<String>,
+    no_media: Vec<String>,
+    failed: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UdemyCurriculumResponse {
+    #[serde(flatten)]
+    curriculum: UdemyCurriculum,
+    sections: Vec<api::UdemySectionSummary>,
 }
 
 /// Fetch the complete curriculum for a course using the authenticated Udemy
@@ -27,16 +44,21 @@ struct UdemyDownloadCompleteEvent {
 pub async fn udemy_get_curriculum(
     plugin: &crate::CoursesPlugin,
     course_id: u64,
-) -> Result<UdemyCurriculum, String> {
+) -> Result<UdemyCurriculumResponse, String> {
     let session = {
         let guard = plugin.udemy_session.lock().await;
         guard.as_ref().cloned().ok_or("not_authenticated")?
     };
     let portal = session.portal_name.clone();
 
-    api::get_course_curriculum(&session, &portal, course_id)
+    let curriculum = api::get_course_curriculum(&session, &portal, course_id)
         .await
-        .map_err(|e| format!("Failed to fetch Udemy curriculum: {e:#}"))
+        .map_err(|e| format!("Failed to fetch Udemy curriculum: {e:#}"))?;
+    let sections = api::summarize_curriculum(&curriculum).sections;
+    Ok(UdemyCurriculumResponse {
+        curriculum,
+        sections,
+    })
 }
 
 async fn fetch_curriculum_via_webview(
@@ -52,77 +74,15 @@ async fn fetch_curriculum_via_api(
     course_id: u64,
     portal_name: &str,
 ) -> Result<UdemyCurriculum, String> {
-    let client = {
+    let session = {
         let guard = plugin.udemy_session.lock().await;
-        let session = guard.as_ref().ok_or("not_authenticated")?;
-        session.client.clone()
+        guard.clone().ok_or("not_authenticated")?
     };
 
-    let url = format!(
-        "https://{}.udemy.com/api-2.0/courses/{}/subscriber-curriculum-items/?fields[lecture]=title,object_index,asset,supplementary_assets&fields[quiz]=title,object_index,type&fields[practice]=title,object_index&fields[chapter]=title,object_index&fields[asset]=title,filename,asset_type,status,is_external,media_license_token,course_is_drmed,media_sources,captions,stream_urls,download_urls,external_url,body&page_size=200",
-        portal_name, course_id
-    );
-
-    tracing::info!("[udemy-api] fetching curriculum via direct API for course {}", course_id);
-
-    let resp = client
-        .get(&url)
-        .send()
+    api::get_course_curriculum(&session, portal_name, course_id)
         .await
-        .map_err(|e| format!("API request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("API returned status {}", resp.status()));
-    }
-
-    let body = resp.text().await.map_err(|e| format!("Read body failed: {}", e))?;
-
-    let mut data: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-
-    let mut all_results = data.get("results")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    loop {
-        let next_url = data.get("next").and_then(|n| n.as_str()).map(|s| s.to_string());
-        match next_url {
-            Some(next) if !next.is_empty() => {
-                tracing::info!("[udemy-api] fetching next curriculum page via direct API");
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                let page_resp = client
-                    .get(&next)
-                    .send()
-                    .await
-                    .map_err(|e| format!("API page request failed: {}", e))?;
-
-                if !page_resp.status().is_success() {
-                    break;
-                }
-
-                let page_body = page_resp.text().await
-                    .map_err(|e| format!("Read page body failed: {}", e))?;
-
-                let page_data: serde_json::Value = serde_json::from_str(&page_body)
-                    .map_err(|e| format!("JSON parse error on page: {}", e))?;
-
-                if let Some(new_results) = page_data.get("results").and_then(|r| r.as_array()) {
-                    all_results.extend(new_results.iter().cloned());
-                }
-
-                data = page_data;
-            }
-            _ => break,
-        }
-    }
-
-    tracing::info!("[udemy-api] curriculum fetched via direct API: {} items total", all_results.len());
-
-    api::parse_curriculum(course_id, &all_results).map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())
 }
-
 
 pub async fn start_udemy_course_download(
     host: std::sync::Arc<dyn omniget_plugin_sdk::PluginHost>,
@@ -130,6 +90,7 @@ pub async fn start_udemy_course_download(
     course_json: String,
     output_dir: String,
     chapter_filter_raw: Option<String>,
+    section_ids: Option<Vec<u64>>,
 ) -> Result<String, String> {
     let course: UdemyCourse =
         serde_json::from_str(&course_json).map_err(|e| format!("Invalid JSON: {}", e))?;
@@ -160,26 +121,54 @@ pub async fn start_udemy_course_download(
     let curriculum = match fetch_curriculum_via_api(&plugin, course_id, &portal).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("[udemy] direct API curriculum failed for portal={}, falling back to webview: {}", portal, e);
+            tracing::warn!(
+                "[udemy] direct API curriculum failed for portal={}, falling back to webview: {}",
+                portal,
+                e
+            );
             match fetch_curriculum_via_webview(&host, course_id, &portal).await {
                 Ok(c) => c,
                 Err(e2) => {
                     active.lock().await.remove(&course_id);
-                    return Err(format!("Failed to fetch curriculum: API={}, Webview={}", e, e2));
+                    return Err(format!(
+                        "Failed to fetch curriculum: API={}, Webview={}",
+                        e, e2
+                    ));
                 }
             }
         }
     };
 
     let settings = crate::settings_reader::load_app_settings();
-    let target_quality = crate::platforms::udemy::downloader::parse_quality_pref(
-        &settings.download.video_quality,
-    );
+    let target_quality =
+        crate::platforms::udemy::downloader::parse_quality_pref(&settings.download.video_quality);
     let continuous_lecture_numbers = settings.download.continuous_lecture_numbers;
     let chapter_filter = chapter_filter_raw
         .as_deref()
         .map(crate::platforms::udemy::api::parse_chapter_filter)
         .unwrap_or_default();
+    let section_ids: std::collections::HashSet<u64> =
+        section_ids.unwrap_or_default().into_iter().collect();
+    if !section_ids.is_empty() {
+        let known: Vec<u64> = curriculum.chapters.iter().map(|c| c.id).collect();
+        let unknown: Vec<u64> = section_ids
+            .iter()
+            .copied()
+            .filter(|id| !known.contains(id))
+            .collect();
+        if !unknown.is_empty() {
+            active.lock().await.remove(&course_id);
+            return Err(format!(
+                "unknown section ids for this course: {:?}",
+                unknown
+            ));
+        }
+        tracing::info!(
+            "[udemy] downloading {} of {} sections",
+            section_ids.len(),
+            known.len()
+        );
+    }
 
     let download_captions = settings.download.download_subtitles;
     let caption_locale = settings.download.caption_locale.clone();
@@ -195,7 +184,11 @@ pub async fn start_udemy_course_download(
                     Some(s) => match api::get_course_locale(&s, &portal, course_id).await {
                         Ok(l) => l,
                         Err(e) => {
-                            tracing::warn!("[udemy] failed to fetch course locale for {}: {}", course_id, e);
+                            tracing::warn!(
+                                "[udemy] failed to fetch course locale for {}: {}",
+                                course_id,
+                                e
+                            );
                             None
                         }
                     },
@@ -224,6 +217,7 @@ pub async fn start_udemy_course_download(
             target_quality,
             continuous_lecture_numbers,
             chapter_filter,
+            section_ids,
             download_captions,
             caption_locale,
             course_locale,
@@ -234,7 +228,10 @@ pub async fn start_udemy_course_download(
         let host_clone = host.clone();
         let progress_forwarder = tokio::spawn(async move {
             while let Some(progress) = rx.recv().await {
-                let _ = host_clone.emit_event("udemy-download-progress", serde_json::to_value(&progress).unwrap_or_default());
+                let _ = host_clone.emit_event(
+                    "udemy-download-progress",
+                    serde_json::to_value(&progress).unwrap_or_default(),
+                );
             }
         });
 
@@ -250,33 +247,75 @@ pub async fn start_udemy_course_download(
         }
 
         match result {
-            Ok(()) => {
+            Ok(summary) => {
+                if summary.drm_skipped > 0 {
+                    let _ = host.emit_event("udemy-download-progress", serde_json::json!({
+                        "courseId": course_id,
+                        "type": "drm_warning",
+                        "drm_skipped": summary.drm_skipped,
+                        "message": format!("{} lectures have DRM protection and were skipped", summary.drm_skipped)
+                    }));
+                }
+                if summary.no_media + summary.failed > 0 {
+                    let _ = host.emit_event("udemy-download-progress", serde_json::json!({
+                        "courseId": course_id,
+                        "type": "skipped_warning",
+                        "no_media": summary.no_media,
+                        "failed": summary.failed,
+                        "titles": summary.no_media_titles.iter().chain(summary.failed_titles.iter()).cloned().collect::<Vec<_>>(),
+                        "message": format!(
+                            "{} lectures had no downloadable media and {} failed",
+                            summary.no_media, summary.failed
+                        )
+                    }));
+                }
                 let _ = host.emit_event(
-                    "udemy-download-complete", serde_json::to_value(&UdemyDownloadCompleteEvent {
+                    "udemy-download-complete",
+                    serde_json::to_value(&UdemyDownloadCompleteEvent {
                         course_id,
                         course_name: course.title,
-                        success: true,
-                        error: None,
-                        drm_skipped: 0,
-                    },).unwrap_or_default());
+                        success: summary.completion_error().is_none(),
+                        error: summary.completion_error(),
+                        drm_skipped: summary.drm_skipped,
+                        videos_downloaded: summary.videos_downloaded,
+                        videos_already_present: summary.videos_already_present,
+                        no_media: summary.no_media,
+                        failed: summary.failed,
+                        lectures_processed: summary.lectures_processed,
+                        skipped: UdemySkippedLectures {
+                            drm: summary.drm_skipped_titles,
+                            no_media: summary.no_media_titles,
+                            failed: summary.failed_titles,
+                        },
+                    })
+                    .unwrap_or_default(),
+                );
             }
             Err(e) => {
                 tracing::error!("[udemy] download error for '{}': {}", course.title, e);
                 let _ = host.emit_event(
-                    "udemy-download-complete", serde_json::to_value(&UdemyDownloadCompleteEvent {
+                    "udemy-download-complete",
+                    serde_json::to_value(&UdemyDownloadCompleteEvent {
                         course_id,
                         course_name: course.title,
                         success: false,
                         error: Some(e.to_string()),
                         drm_skipped: 0,
-                    },).unwrap_or_default());
+                        videos_downloaded: 0,
+                        videos_already_present: 0,
+                        no_media: 0,
+                        failed: 0,
+                        lectures_processed: 0,
+                        skipped: UdemySkippedLectures::default(),
+                    })
+                    .unwrap_or_default(),
+                );
             }
         }
     });
 
     Ok(format!("Download started: {}", course_name))
 }
-
 
 pub async fn cancel_udemy_course_download(
     plugin: &crate::CoursesPlugin,
@@ -296,6 +335,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn curriculum_response_preserves_raw_automation_and_section_picker_fields() {
+        let curriculum = api::parse_curriculum(42, &[]).unwrap();
+        let sections = api::summarize_curriculum(&curriculum).sections;
+        let response = serde_json::to_value(UdemyCurriculumResponse {
+            curriculum,
+            sections,
+        })
+        .unwrap();
+        assert_eq!(response["course_id"], 42);
+        assert!(response["chapters"].is_array());
+        assert!(response["sections"].is_array());
+        assert!(response["drm_video_lectures"].is_number());
+    }
+
+    #[test]
     fn completion_event_serializes_course_id_for_api_correlation() {
         let value = serde_json::to_value(UdemyDownloadCompleteEvent {
             course_id: 42,
@@ -303,6 +357,7 @@ mod tests {
             success: true,
             error: None,
             drm_skipped: 0,
+            ..Default::default()
         })
         .unwrap();
 

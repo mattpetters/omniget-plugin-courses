@@ -1,22 +1,17 @@
 use std::time::{Duration, Instant};
 
 use crate::platforms::udemy::auth::{
-    authenticate_with_cookie_json, authenticate_with_netscape_cookie_file,
-    delete_saved_session, load_saved_session, request_otp, save_session, verify_otp,
+    authenticate_with_cookie_json, authenticate_with_netscape_cookie_file, delete_saved_session,
+    load_saved_session, request_otp, save_session, verify_otp,
 };
-
 
 const SESSION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-
-pub async fn udemy_request_otp(
-    email: String,
-) -> Result<(), String> {
+pub async fn udemy_request_otp(email: String) -> Result<(), String> {
     request_otp(&email)
         .await
         .map_err(|e| format!("OTP request failed: {}", e))
 }
-
 
 pub async fn udemy_verify_otp(
     plugin: &crate::CoursesPlugin,
@@ -44,7 +39,6 @@ pub async fn udemy_verify_otp(
     }
 }
 
-
 pub async fn udemy_login(
     _host: std::sync::Arc<dyn omniget_plugin_sdk::PluginHost>,
     _plugin: &crate::CoursesPlugin,
@@ -52,7 +46,6 @@ pub async fn udemy_login(
 ) -> Result<String, String> {
     Err("Please use Browser Login for Udemy. The email login is not supported due to Cloudflare protection.".to_string())
 }
-
 
 pub async fn udemy_login_cookies(
     plugin: &crate::CoursesPlugin,
@@ -79,10 +72,7 @@ pub async fn udemy_login_cookies(
     }
 }
 
-
-pub async fn udemy_check_session(
-    plugin: &crate::CoursesPlugin,
-) -> Result<String, String> {
+pub async fn udemy_check_session(plugin: &crate::CoursesPlugin) -> Result<String, String> {
     let has_memory_session = plugin.udemy_session.lock().await.is_some();
 
     if !has_memory_session {
@@ -105,10 +95,7 @@ pub async fn udemy_check_session(
                         *plugin.udemy_session.lock().await = Some(session);
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            "[udemy] managed cookie session restore failed: {}",
-                            error
-                        );
+                        tracing::warn!("[udemy] managed cookie session restore failed: {}", error);
                         return Err("not_authenticated".to_string());
                     }
                 }
@@ -155,12 +142,18 @@ pub async fn udemy_check_session(
     } else if status == reqwest::StatusCode::FORBIDDEN {
         let body = resp.text().await.unwrap_or_default();
         let body_lower = body.to_lowercase();
-        if body_lower.contains("just a moment") || body_lower.contains("cf_chl") || body_lower.contains("<!doctype") {
+        if body_lower.contains("just a moment")
+            || body_lower.contains("cf_chl")
+            || body_lower.contains("<!doctype")
+        {
             tracing::warn!("[udemy] check_session got Cloudflare challenge, keeping session alive");
             *plugin.udemy_session_validated_at.lock().await = Some(Instant::now());
             Ok(email)
         } else {
-            tracing::error!("[udemy] check_session got real 403: {}", &body[..body.len().min(300)]);
+            tracing::error!(
+                "[udemy] check_session got real 403: {}",
+                &body[..body.len().min(300)]
+            );
             plugin.udemy_session.lock().await.take();
             *plugin.udemy_session_validated_at.lock().await = None;
             *plugin.udemy_courses_cache.lock().await = None;
@@ -172,10 +165,7 @@ pub async fn udemy_check_session(
     }
 }
 
-
-pub async fn udemy_get_portal(
-    plugin: &crate::CoursesPlugin,
-) -> Result<String, String> {
+pub async fn udemy_get_portal(plugin: &crate::CoursesPlugin) -> Result<String, String> {
     let guard = plugin.udemy_session.lock().await;
     Ok(guard
         .as_ref()
@@ -183,10 +173,7 @@ pub async fn udemy_get_portal(
         .unwrap_or_else(|| "www".into()))
 }
 
-
-pub async fn udemy_logout(
-    plugin: &crate::CoursesPlugin,
-) -> Result<(), String> {
+pub async fn udemy_logout(plugin: &crate::CoursesPlugin) -> Result<(), String> {
     let _ = delete_saved_session().await;
     plugin.udemy_session.lock().await.take();
     *plugin.udemy_session_validated_at.lock().await = None;
@@ -194,7 +181,6 @@ pub async fn udemy_logout(
     plugin.udemy_api_webview.lock().await.take();
     Ok(())
 }
-
 
 pub async fn udemy_set_cookies(
     plugin: &crate::CoursesPlugin,

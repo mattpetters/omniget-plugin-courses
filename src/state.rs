@@ -1,8 +1,7 @@
 use crate::platforms::hotmart::api::Course;
-use crate::platforms::udemy::api::UdemyCourse;
 use crate::platforms::kiwify::api::KiwifyCourse;
 use crate::platforms::rocketseat::api::RocketseatCourse;
-
+use crate::platforms::udemy::api::UdemyCourse;
 
 pub struct CoursesCache {
     pub courses: Vec<Course>,
@@ -21,5 +20,10 @@ pub struct KiwifyCoursesCache {
 
 pub struct RocketseatCoursesCache {
     pub courses: Vec<RocketseatCourse>,
+    pub fetched_at: std::time::Instant,
+}
+
+pub struct MetaCoursesCache {
+    pub courses: Vec<crate::platforms::metaanalysis::api::MetaCourse>,
     pub fetched_at: std::time::Instant,
 }

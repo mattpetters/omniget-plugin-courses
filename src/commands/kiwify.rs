@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use crate::platforms::kiwify::api::{self, KiwifyCourse, KiwifySession};
 use crate::platforms::kiwify::downloader;
 
-
 const SESSION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const COURSES_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -18,7 +17,6 @@ struct KiwifyDownloadCompleteEvent {
     success: bool,
     error: Option<String>,
 }
-
 
 pub async fn kiwify_login(
     plugin: &crate::CoursesPlugin,
@@ -46,7 +44,6 @@ pub async fn kiwify_login(
     }
 }
 
-
 pub async fn kiwify_login_token(
     plugin: &crate::CoursesPlugin,
     token: String,
@@ -62,10 +59,15 @@ pub async fn kiwify_login_token(
         token: parsed_token.clone(),
         email: String::new(),
         client: omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
-            .user_agent("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0")
+            .user_agent(
+                "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            )
             .default_headers({
                 let mut h = reqwest::header::HeaderMap::new();
-                h.insert("Authorization", format!("Bearer {}", parsed_token).parse().unwrap());
+                h.insert(
+                    "Authorization",
+                    format!("Bearer {}", parsed_token).parse().unwrap(),
+                );
                 h.insert("Accept", "application/json".parse().unwrap());
                 h.insert("Origin", "https://admin.kiwify.com.br".parse().unwrap());
                 h.insert("Referer", "https://admin.kiwify.com.br/".parse().unwrap());
@@ -90,10 +92,7 @@ pub async fn kiwify_login_token(
     }
 }
 
-
-pub async fn kiwify_check_session(
-    plugin: &crate::CoursesPlugin,
-) -> Result<String, String> {
+pub async fn kiwify_check_session(plugin: &crate::CoursesPlugin) -> Result<String, String> {
     let has_memory_session = plugin.kiwify_session.lock().await.is_some();
 
     if !has_memory_session {
@@ -145,10 +144,7 @@ pub async fn kiwify_check_session(
     }
 }
 
-
-pub async fn kiwify_logout(
-    plugin: &crate::CoursesPlugin,
-) -> Result<(), String> {
+pub async fn kiwify_logout(plugin: &crate::CoursesPlugin) -> Result<(), String> {
     let _ = api::delete_saved_session().await;
     plugin.kiwify_session.lock().await.take();
     *plugin.kiwify_session_validated_at.lock().await = None;
@@ -156,9 +152,7 @@ pub async fn kiwify_logout(
     Ok(())
 }
 
-async fn fetch_kiwify_courses(
-    plugin: &crate::CoursesPlugin,
-) -> Result<Vec<KiwifyCourse>, String> {
+async fn fetch_kiwify_courses(plugin: &crate::CoursesPlugin) -> Result<Vec<KiwifyCourse>, String> {
     let session = {
         let guard = plugin.kiwify_session.lock().await;
         guard
@@ -184,7 +178,6 @@ async fn fetch_kiwify_courses(
     Ok(courses)
 }
 
-
 pub async fn kiwify_list_courses(
     plugin: &crate::CoursesPlugin,
 ) -> Result<Vec<KiwifyCourse>, String> {
@@ -200,7 +193,6 @@ pub async fn kiwify_list_courses(
     fetch_kiwify_courses(&plugin).await
 }
 
-
 pub async fn kiwify_refresh_courses(
     plugin: &crate::CoursesPlugin,
 ) -> Result<Vec<KiwifyCourse>, String> {
@@ -210,7 +202,6 @@ pub async fn kiwify_refresh_courses(
     }
     fetch_kiwify_courses(&plugin).await
 }
-
 
 pub async fn start_kiwify_course_download(
     host: std::sync::Arc<dyn omniget_plugin_sdk::PluginHost>,
@@ -260,20 +251,26 @@ pub async fn start_kiwify_course_download(
         match result {
             Ok(()) => {
                 let _ = host.emit_event(
-                    "download-complete", serde_json::to_value(&KiwifyDownloadCompleteEvent {
+                    "download-complete",
+                    serde_json::to_value(&KiwifyDownloadCompleteEvent {
                         course_name: course.name,
                         success: true,
                         error: None,
-                    },).unwrap_or_default());
+                    })
+                    .unwrap_or_default(),
+                );
             }
             Err(e) => {
                 tracing::error!("[kiwify] download error for '{}': {}", course.name, e);
                 let _ = host.emit_event(
-                    "download-complete", serde_json::to_value(&KiwifyDownloadCompleteEvent {
+                    "download-complete",
+                    serde_json::to_value(&KiwifyDownloadCompleteEvent {
                         course_name: course.name,
                         success: false,
                         error: Some(e.to_string()),
-                    },).unwrap_or_default());
+                    })
+                    .unwrap_or_default(),
+                );
             }
         }
     });

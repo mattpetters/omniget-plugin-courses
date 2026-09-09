@@ -18,7 +18,14 @@ pub fn detect_players_from_html(html: &str) -> Vec<DetectedPlayer> {
     let doc = Html::parse_document(html);
     let sel = Selector::parse("iframe").unwrap();
 
-    let allowlist = ["vimeo", "youtu", "pandavideo", "liquid", "wistia", "videodelivery"];
+    let allowlist = [
+        "vimeo",
+        "youtu",
+        "pandavideo",
+        "liquid",
+        "wistia",
+        "videodelivery",
+    ];
 
     doc.select(&sel)
         .filter_map(|el| {

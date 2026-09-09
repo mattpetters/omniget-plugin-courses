@@ -1,8 +1,6 @@
 use anyhow::anyhow;
 
-pub async fn create_api_webview(
-    _portal_name: &str,
-) -> anyhow::Result<()> {
+pub async fn create_api_webview(_portal_name: &str) -> anyhow::Result<()> {
     Err(anyhow!("Webview API not available in plugin mode"))
 }
 

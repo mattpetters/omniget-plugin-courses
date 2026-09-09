@@ -7,13 +7,16 @@ use reqwest::cookie::Jar;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Clone)]
 pub struct HotmartSession {
     pub token: String,
     pub email: String,
     pub client: reqwest::Client,
+    /// Cookies (and web-storage entries) captured at login. The SSO cookies
+    /// among them let the plugin mint a new OIDC token when this one expires.
     pub cookies: Vec<(String, String)>,
+    /// Unix time the OIDC access token expires, when known.
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,12 +25,55 @@ pub struct SavedSession {
     pub email: String,
     pub cookies: Vec<(String, String)>,
     pub saved_at: u64,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+impl HotmartSession {
+    pub fn from_saved(saved: SavedSession) -> anyhow::Result<Self> {
+        let client = build_client_from_saved(&saved)?;
+        Ok(Self {
+            token: saved.token,
+            email: saved.email,
+            client,
+            cookies: saved.cookies,
+            expires_at: saved.expires_at,
+        })
+    }
+
+    pub fn to_saved(&self) -> SavedSession {
+        SavedSession {
+            token: self.token.clone(),
+            email: self.email.clone(),
+            cookies: self.cookies.clone(),
+            saved_at: super::oidc::now_unix(),
+            expires_at: self.expires_at,
+        }
+    }
+
+    /// Replaces the bearer token (after a PKCE renewal), keeping the cookies.
+    pub fn with_token(&self, token: String, expires_at: Option<u64>) -> anyhow::Result<Self> {
+        let saved = SavedSession {
+            token,
+            email: self.email.clone(),
+            cookies: self.cookies.clone(),
+            saved_at: super::oidc::now_unix(),
+            expires_at,
+        };
+        Self::from_saved(saved)
+    }
+
+    /// True when the token is known to expire within the next minute.
+    pub fn is_expired(&self) -> bool {
+        matches!(self.expires_at, Some(at) if at <= super::oidc::now_unix() + 60)
+    }
 }
 
 fn session_file_path() -> anyhow::Result<PathBuf> {
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| anyhow!("Could not find app data directory"))?;
-    Ok(data_dir.join("wtf.tonho.omniget").join("hotmart_session.json"))
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Could not find app data directory"))?;
+    Ok(data_dir
+        .join("wtf.tonho.omniget")
+        .join("hotmart_session.json"))
 }
 
 pub fn build_client_from_saved(saved: &SavedSession) -> anyhow::Result<reqwest::Client> {
@@ -41,6 +87,9 @@ pub fn build_client_from_saved(saved: &SavedSession) -> anyhow::Result<reqwest::
         "https://api-club-hot-club-api.cb.hotmart.com",
     ];
     for (name, value) in &saved.cookies {
+        if name.contains(':') {
+            continue;
+        }
         let cookie_str = format!("{}={}; Domain=.hotmart.com; Path=/", name, value);
         for domain in &domains {
             jar.add_cookie_str(&cookie_str, &domain.parse().unwrap());
@@ -85,19 +134,15 @@ pub async fn save_session(session: &HotmartSession) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let saved = SavedSession {
-        token: session.token.clone(),
-        email: session.email.clone(),
-        cookies: session.cookies.clone(),
-        saved_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    };
+    let saved = session.to_saved();
 
     let json = serde_json::to_string_pretty(&saved)?;
     std::fs::write(&path, json)?;
-    tracing::info!("[session] saved for {}, {} cookies", session.email, session.cookies.len());
+    tracing::info!(
+        "[session] saved for {}, {} cookies",
+        session.email,
+        session.cookies.len()
+    );
     Ok(())
 }
 
@@ -106,16 +151,13 @@ pub async fn load_saved_session() -> anyhow::Result<HotmartSession> {
     let json = std::fs::read_to_string(&path)?;
     let saved: SavedSession = serde_json::from_str(&json)?;
 
-    tracing::info!("[session] loaded for {}, {} cookies", saved.email, saved.cookies.len());
+    tracing::info!(
+        "[session] loaded for {}, {} cookies",
+        saved.email,
+        saved.cookies.len()
+    );
 
-    let client = build_client_from_saved(&saved)?;
-
-    Ok(HotmartSession {
-        token: saved.token,
-        email: saved.email,
-        cookies: saved.cookies,
-        client,
-    })
+    HotmartSession::from_saved(saved)
 }
 
 pub async fn delete_saved_session() -> anyhow::Result<()> {
@@ -137,17 +179,18 @@ const COOKIE_URIS: &[&str] = &[
 
 #[cfg(windows)]
 #[allow(dead_code)]
-async fn extract_webview_cookies_for_uri(
-        _uri: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    Err(anyhow!("Webview cookie extraction not available in plugin mode"))
+async fn extract_webview_cookies_for_uri(_uri: &str) -> anyhow::Result<Vec<(String, String)>> {
+    Err(anyhow!(
+        "Webview cookie extraction not available in plugin mode"
+    ))
 }
 
 #[cfg(windows)]
 #[allow(dead_code)]
-async fn extract_webview_cookies(
-    ) -> anyhow::Result<Vec<(String, String)>> {
-    Err(anyhow!("Webview cookie extraction not available in plugin mode"))
+async fn extract_webview_cookies() -> anyhow::Result<Vec<(String, String)>> {
+    Err(anyhow!(
+        "Webview cookie extraction not available in plugin mode"
+    ))
 }
 
 #[allow(dead_code)]
@@ -166,9 +209,11 @@ fn parse_document_cookie(s: &str) -> Vec<(String, String)> {
 
 #[cfg(not(windows))]
 async fn extract_webview_cookies_js(
-        _cookie_data: &Arc<std::sync::Mutex<Option<String>>>,
+    _cookie_data: &Arc<std::sync::Mutex<Option<String>>>,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    Err(anyhow!("Webview cookie extraction not available in plugin mode"))
+    Err(anyhow!(
+        "Webview cookie extraction not available in plugin mode"
+    ))
 }
 
 pub async fn authenticate(
@@ -201,34 +246,48 @@ pub async fn authenticate(
         .map_err(|e| anyhow!("Login request failed: {}", e))?;
 
     let status = resp.status();
-    let body_text = resp.text().await
+    let body_text = resp
+        .text()
+        .await
         .map_err(|e| anyhow!("Failed to read login response: {}", e))?;
 
-    tracing::info!("[hotmart] login response status: {}, body: {}", status, &body_text[..body_text.len().min(500)]);
+    tracing::info!(
+        "[hotmart] login response status: {}, body: {}",
+        status,
+        &body_text[..body_text.len().min(500)]
+    );
 
     if !status.is_success() {
         let body: serde_json::Value = serde_json::from_str(&body_text).unwrap_or_default();
 
-        if body_text.to_lowercase().contains("captcha")
-            || status.as_u16() == 403
-        {
+        if body_text.to_lowercase().contains("captcha") || status.as_u16() == 403 {
             tracing::warn!("[hotmart] captcha required during login");
             let _ = host.emit_event(
                 "hotmart-auth-captcha",
                 serde_json::json!({"message": "Captcha required. Please use browser login."}),
             );
-            return Err(anyhow!("Captcha required. Please use browser login instead."));
+            return Err(anyhow!(
+                "Captcha required. Please use browser login instead."
+            ));
         }
 
         let error_msg = body
             .get("message")
             .or_else(|| body.get("error_description"))
             .and_then(|v| v.as_str())
-            .or_else(|| body.get("error").and_then(|v| v.get("message")).and_then(|v| v.as_str()))
+            .or_else(|| {
+                body.get("error")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.as_str())
+            })
             .or_else(|| body.get("error").and_then(|v| v.as_str()))
             .unwrap_or(&body_text[..body_text.len().min(200)]);
 
-        return Err(anyhow!("Authentication failed (status {}): {}", status, error_msg));
+        return Err(anyhow!(
+            "Authentication failed (status {}): {}",
+            status,
+            error_msg
+        ));
     }
 
     let body: serde_json::Value = serde_json::from_str(&body_text)
@@ -238,30 +297,25 @@ pub async fn authenticate(
         .get("access_token")
         .or_else(|| body.get("token"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("No access_token in login response. Keys: {:?}", body.as_object().map(|o| o.keys().collect::<Vec<_>>())))?
+        .ok_or_else(|| {
+            anyhow!(
+                "No access_token in login response. Keys: {:?}",
+                body.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            )
+        })?
         .to_string();
 
     let cookies = vec![("access_token".to_string(), token.clone())];
 
     let saved = SavedSession {
-        token: token.clone(),
+        token,
         email: email.to_string(),
-        cookies: cookies.clone(),
-        saved_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        cookies,
+        saved_at: super::oidc::now_unix(),
+        expires_at: None,
     };
-
-    let client = build_client_from_saved(&saved)
-        .map_err(|e| anyhow!("Failed to build session client: {}", e))?;
 
     tracing::info!("[hotmart] login successful for {}", email);
 
-    Ok(HotmartSession {
-        token,
-        email: email.to_string(),
-        client,
-        cookies,
-    })
+    HotmartSession::from_saved(saved).map_err(|e| anyhow!("Failed to build session client: {}", e))
 }

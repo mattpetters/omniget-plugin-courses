@@ -1,6 +1,6 @@
 [package]
 name = "omniget-plugin-courses"
-version = "1.0.8-mpfork"
+version = "1.1.0-mpfork-0.1"
 edition = "2021"
 
 [lib]
@@ -42,3 +42,8 @@ windows-core = "0.61"
 [patch."https://github.com/tonhowtf/omniget"]
 omniget-plugin-sdk = { path = "../omniget/src-tauri/omniget-plugin-sdk" }
 omniget-core = { path = "../omniget/src-tauri/omniget-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

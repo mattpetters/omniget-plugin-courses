@@ -3,13 +3,15 @@ pub mod platforms;
 pub mod settings_reader;
 pub mod state;
 
+use crate::platforms::hotmart::auth::HotmartSession;
+use crate::platforms::udemy::auth::UdemySession;
+use crate::state::{
+    CoursesCache, KiwifyCoursesCache, MetaCoursesCache, RocketseatCoursesCache, UdemyCoursesCache,
+};
+use omniget_plugin_sdk::{OmnigetPlugin, PluginHost};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use omniget_plugin_sdk::{OmnigetPlugin, PluginHost};
-use crate::state::{CoursesCache, UdemyCoursesCache, KiwifyCoursesCache, RocketseatCoursesCache};
-use crate::platforms::hotmart::auth::HotmartSession;
-use crate::platforms::udemy::auth::UdemySession;
 
 #[derive(serde::Serialize, Clone)]
 struct LoginMethod {
@@ -37,6 +39,8 @@ struct PlatformCommands {
     cancel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     search: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    curriculum: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -81,12 +85,18 @@ pub struct CoursesPlugin {
     pub udemy_session_validated_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     pub udemy_api_webview: Arc<tokio::sync::Mutex<Option<String>>>,
     pub udemy_api_result: Arc<std::sync::Mutex<Option<String>>>,
-    pub kiwify_session: Arc<tokio::sync::Mutex<Option<crate::platforms::kiwify::api::KiwifySession>>>,
+    pub kiwify_session:
+        Arc<tokio::sync::Mutex<Option<crate::platforms::kiwify::api::KiwifySession>>>,
     pub kiwify_courses_cache: Arc<tokio::sync::Mutex<Option<KiwifyCoursesCache>>>,
     pub kiwify_session_validated_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
-    pub rocketseat_session: Arc<tokio::sync::Mutex<Option<crate::platforms::rocketseat::api::RocketseatSession>>>,
+    pub rocketseat_session:
+        Arc<tokio::sync::Mutex<Option<crate::platforms::rocketseat::api::RocketseatSession>>>,
     pub rocketseat_courses_cache: Arc<tokio::sync::Mutex<Option<RocketseatCoursesCache>>>,
     pub rocketseat_session_validated_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    pub metaanalysis_session:
+        Arc<tokio::sync::Mutex<Option<crate::platforms::metaanalysis::api::MetaSession>>>,
+    pub metaanalysis_courses_cache: Arc<tokio::sync::Mutex<Option<MetaCoursesCache>>>,
+    pub metaanalysis_session_validated_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl Clone for CoursesPlugin {
@@ -109,6 +119,9 @@ impl Clone for CoursesPlugin {
             rocketseat_session: self.rocketseat_session.clone(),
             rocketseat_courses_cache: self.rocketseat_courses_cache.clone(),
             rocketseat_session_validated_at: self.rocketseat_session_validated_at.clone(),
+            metaanalysis_session: self.metaanalysis_session.clone(),
+            metaanalysis_courses_cache: self.metaanalysis_courses_cache.clone(),
+            metaanalysis_session_validated_at: self.metaanalysis_session_validated_at.clone(),
         }
     }
 }
@@ -138,6 +151,9 @@ impl CoursesPlugin {
             rocketseat_session: Arc::new(tokio::sync::Mutex::new(None)),
             rocketseat_courses_cache: Arc::new(tokio::sync::Mutex::new(None)),
             rocketseat_session_validated_at: Arc::new(tokio::sync::Mutex::new(None)),
+            metaanalysis_session: Arc::new(tokio::sync::Mutex::new(None)),
+            metaanalysis_courses_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            metaanalysis_session_validated_at: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -145,92 +161,287 @@ impl CoursesPlugin {
 fn get_all_platform_configs() -> Vec<PlatformUiConfig> {
     vec![
         PlatformUiConfig {
-            id: "hotmart".into(), name: "Hotmart".into(), color: "#F04E23".into(), icon: "hotmart".into(),
+            id: "hotmart".into(),
+            name: "Hotmart".into(),
+            color: "#F04E23".into(),
+            icon: "hotmart".into(),
             login_methods: vec![
-                LoginMethod { method_type: "browser".into(), command: "hotmart_set_cookies".into(), extra_fields: vec![
-                    ExtraField { key: "url".into(), label: "Login URL".into(), placeholder: "https://sso.hotmart.com/login?redirect=https%3A%2F%2Fconsumer.hotmart.com".into(), field_type: "hidden".into() },
-                    ExtraField { key: "cookie_domains".into(), label: "Cookie Domains".into(), placeholder: ".hotmart.com,.sso.hotmart.com,.consumer.hotmart.com,.api-sec-vlc.hotmart.com".into(), field_type: "hidden".into() },
-                    ExtraField { key: "success_url".into(), label: "Success URL".into(), placeholder: "consumer.hotmart.com".into(), field_type: "hidden".into() },
-                    ExtraField { key: "wait_for_cookie".into(), label: "Wait For Cookie".into(), placeholder: "hmVlcIntegration".into(), field_type: "hidden".into() },
-                ] },
+                // consumer.hotmart.com runs the OIDC login itself (email + code,
+                // password, Google/Apple) and keeps the session in web storage
+                // under `oidc.user:…`; the legacy hmVlcIntegration cookie is
+                // still accepted for older captures.
+                LoginMethod {
+                    method_type: "browser".into(),
+                    command: "hotmart_set_cookies".into(),
+                    extra_fields: vec![
+                        ExtraField {
+                            key: "url".into(),
+                            label: "Login URL".into(),
+                            placeholder: "https://consumer.hotmart.com/".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "cookie_domains".into(),
+                            label: "Cookie Domains".into(),
+                            placeholder: ".hotmart.com,.sso.hotmart.com,.consumer.hotmart.com"
+                                .into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "success_url".into(),
+                            label: "Success URL".into(),
+                            placeholder: "consumer.hotmart.com".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "wait_for_cookie".into(),
+                            label: "Wait For Cookie".into(),
+                            placeholder: "oidc.user:*|hmVlcIntegration".into(),
+                            field_type: "hidden".into(),
+                        },
+                    ],
+                },
+                LoginMethod {
+                    method_type: "cookies".into(),
+                    command: "hotmart_set_cookies".into(),
+                    extra_fields: vec![],
+                },
             ],
             commands: PlatformCommands {
-                check_session: "hotmart_check_session".into(), logout: "hotmart_logout".into(),
-                list: "hotmart_list_courses".into(), refresh: "hotmart_refresh_courses".into(),
-                download: "start_course_download".into(), cancel: Some("cancel_course_download".into()), search: None,
+                check_session: "hotmart_check_session".into(),
+                logout: "hotmart_logout".into(),
+                list: "hotmart_list_courses".into(),
+                refresh: "hotmart_refresh_courses".into(),
+                download: "start_course_download".into(),
+                cancel: Some("cancel_course_download".into()),
+                search: None,
+                curriculum: None,
             },
             features: PlatformFeatures {
-                captcha_event: Some("hotmart-auth-captcha".into()), has_search: None,
-                download_arg_name: None, list_returns_key: None,
+                captcha_event: Some("hotmart-auth-captcha".into()),
+                has_search: None,
+                download_arg_name: None,
+                list_returns_key: None,
                 item_subtitle_field: Some("price".into()),
-                session_display: None, string_ids: None,
+                session_display: None,
+                string_ids: None,
             },
         },
         PlatformUiConfig {
-            id: "udemy".into(), name: "Udemy".into(), color: "#A435F0".into(), icon: "udemy".into(),
+            id: "udemy".into(),
+            name: "Udemy".into(),
+            color: "#A435F0".into(),
+            icon: "udemy".into(),
             login_methods: vec![
-                LoginMethod { method_type: "browser".into(), command: "udemy_set_cookies".into(), extra_fields: vec![
-                    ExtraField { key: "url".into(), label: "Login URL".into(), placeholder: "https://www.udemy.com/join/login-popup/".into(), field_type: "hidden".into() },
-                    ExtraField { key: "cookie_domains".into(), label: "Cookie Domains".into(), placeholder: ".udemy.com,www.udemy.com".into(), field_type: "hidden".into() },
-                    ExtraField { key: "success_url".into(), label: "Success URL".into(), placeholder: "udemy.com/home".into(), field_type: "hidden".into() },
-                ] },
-                LoginMethod { method_type: "cookies".into(), command: "udemy_login_cookies".into(), extra_fields: vec![] },
+                LoginMethod {
+                    method_type: "browser".into(),
+                    command: "udemy_set_cookies".into(),
+                    extra_fields: vec![
+                        ExtraField {
+                            key: "url".into(),
+                            label: "Login URL".into(),
+                            placeholder: "https://www.udemy.com/join/login-popup/".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "cookie_domains".into(),
+                            label: "Cookie Domains".into(),
+                            placeholder: ".udemy.com,www.udemy.com".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "success_url".into(),
+                            label: "Success URL".into(),
+                            placeholder: "udemy.com".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "wait_for_cookie".into(),
+                            label: "Wait For Cookie".into(),
+                            placeholder: "access_token|dj_session_id|udemy_session".into(),
+                            field_type: "hidden".into(),
+                        },
+                    ],
+                },
+                LoginMethod {
+                    method_type: "cookies".into(),
+                    command: "udemy_login_cookies".into(),
+                    extra_fields: vec![],
+                },
             ],
             commands: PlatformCommands {
-                check_session: "udemy_check_session".into(), logout: "udemy_logout".into(),
-                list: "udemy_list_courses".into(), refresh: "udemy_refresh_courses".into(),
-                download: "start_udemy_course_download".into(), cancel: Some("cancel_udemy_course_download".into()), search: None,
+                check_session: "udemy_check_session".into(),
+                logout: "udemy_logout".into(),
+                list: "udemy_list_courses".into(),
+                refresh: "udemy_refresh_courses".into(),
+                download: "start_udemy_course_download".into(),
+                cancel: Some("cancel_udemy_course_download".into()),
+                search: None,
+                curriculum: Some("udemy_get_curriculum".into()),
             },
             features: PlatformFeatures {
-                captcha_event: None, has_search: None,
-                download_arg_name: None, list_returns_key: None,
+                captcha_event: None,
+                has_search: None,
+                download_arg_name: None,
+                list_returns_key: None,
                 item_subtitle_field: Some("num_published_lectures".into()),
-                session_display: None, string_ids: None,
+                session_display: None,
+                string_ids: None,
             },
         },
         PlatformUiConfig {
-            id: "kiwify".into(), name: "Kiwify".into(), color: "#22C55E".into(), icon: "kiwify".into(),
+            id: "kiwify".into(),
+            name: "Kiwify".into(),
+            color: "#22C55E".into(),
+            icon: "kiwify".into(),
             login_methods: vec![
-                LoginMethod { method_type: "email_password".into(), command: "kiwify_login".into(), extra_fields: vec![] },
-                LoginMethod { method_type: "token".into(), command: "kiwify_login_token".into(), extra_fields: vec![] },
+                LoginMethod {
+                    method_type: "email_password".into(),
+                    command: "kiwify_login".into(),
+                    extra_fields: vec![],
+                },
+                LoginMethod {
+                    method_type: "token".into(),
+                    command: "kiwify_login_token".into(),
+                    extra_fields: vec![],
+                },
             ],
             commands: PlatformCommands {
-                check_session: "kiwify_check_session".into(), logout: "kiwify_logout".into(),
-                list: "kiwify_list_courses".into(), refresh: "kiwify_refresh_courses".into(),
-                download: "start_kiwify_course_download".into(), cancel: Some("cancel_kiwify_course_download".into()), search: None,
+                check_session: "kiwify_check_session".into(),
+                logout: "kiwify_logout".into(),
+                list: "kiwify_list_courses".into(),
+                refresh: "kiwify_refresh_courses".into(),
+                download: "start_kiwify_course_download".into(),
+                cancel: Some("cancel_kiwify_course_download".into()),
+                search: None,
+                curriculum: None,
             },
             features: PlatformFeatures {
-                captcha_event: None, has_search: None,
-                download_arg_name: None, list_returns_key: None,
+                captcha_event: None,
+                has_search: None,
+                download_arg_name: None,
+                list_returns_key: None,
                 item_subtitle_field: Some("seller".into()),
-                session_display: None, string_ids: None,
+                session_display: None,
+                string_ids: None,
             },
         },
         PlatformUiConfig {
-            id: "rocketseat".into(), name: "Rocketseat".into(), color: "#8257E5".into(), icon: "rocketseat".into(),
+            id: "rocketseat".into(),
+            name: "Rocketseat".into(),
+            color: "#8257E5".into(),
+            icon: "rocketseat".into(),
             login_methods: vec![
-                LoginMethod { method_type: "token".into(), command: "rocketseat_login_token".into(), extra_fields: vec![] },
+                // app.rocketseat.com.br keeps the JWT in the
+                // `skylab_next_access_token_v4` cookie (not httpOnly), so the
+                // browser login and the Cookie Manager captures both work.
+                LoginMethod {
+                    method_type: "browser".into(),
+                    command: "rocketseat_set_cookies".into(),
+                    extra_fields: vec![
+                        ExtraField {
+                            key: "url".into(),
+                            label: "Login URL".into(),
+                            placeholder: "https://app.rocketseat.com.br/".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "cookie_domains".into(),
+                            label: "Cookie Domains".into(),
+                            placeholder: ".rocketseat.com.br,app.rocketseat.com.br".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "success_url".into(),
+                            label: "Success URL".into(),
+                            placeholder: "app.rocketseat.com.br".into(),
+                            field_type: "hidden".into(),
+                        },
+                        ExtraField {
+                            key: "wait_for_cookie".into(),
+                            label: "Wait For Cookie".into(),
+                            placeholder: "skylab_next_access_token_v4".into(),
+                            field_type: "hidden".into(),
+                        },
+                    ],
+                },
+                LoginMethod {
+                    method_type: "cookies".into(),
+                    command: "rocketseat_set_cookies".into(),
+                    extra_fields: vec![],
+                },
+                LoginMethod {
+                    method_type: "token".into(),
+                    command: "rocketseat_login_token".into(),
+                    extra_fields: vec![],
+                },
             ],
             commands: PlatformCommands {
-                check_session: "rocketseat_check_session".into(), logout: "rocketseat_logout".into(),
-                list: "rocketseat_list_courses".into(), refresh: "rocketseat_refresh_courses".into(),
-                download: "start_rocketseat_course_download".into(), cancel: None,
+                check_session: "rocketseat_check_session".into(),
+                logout: "rocketseat_logout".into(),
+                list: "rocketseat_list_courses".into(),
+                refresh: "rocketseat_refresh_courses".into(),
+                download: "start_rocketseat_course_download".into(),
+                cancel: None,
                 search: Some("rocketseat_search_courses".into()),
+                curriculum: None,
             },
             features: PlatformFeatures {
-                captcha_event: None, has_search: Some(true),
-                download_arg_name: None, list_returns_key: None,
+                captcha_event: None,
+                has_search: Some(true),
+                download_arg_name: None,
+                list_returns_key: None,
                 item_subtitle_field: Some("slug".into()),
-                session_display: Some("platform_name".into()), string_ids: Some(true),
+                session_display: Some("platform_name".into()),
+                string_ids: Some(true),
+            },
+        },
+        PlatformUiConfig {
+            id: "metaanalysis".into(),
+            name: "Meta-Analysis Academy".into(),
+            color: "#4338CA".into(),
+            icon: "metaanalysis".into(),
+            login_methods: vec![
+                // Supabase GoTrue email/password sign-in.
+                LoginMethod {
+                    method_type: "email_password".into(),
+                    command: "metaanalysis_login".into(),
+                    extra_fields: vec![],
+                },
+            ],
+            commands: PlatformCommands {
+                check_session: "metaanalysis_check_session".into(),
+                logout: "metaanalysis_logout".into(),
+                list: "metaanalysis_list_courses".into(),
+                refresh: "metaanalysis_refresh_courses".into(),
+                download: "start_metaanalysis_course_download".into(),
+                cancel: Some("cancel_metaanalysis_course_download".into()),
+                search: None,
+                curriculum: None,
+            },
+            features: PlatformFeatures {
+                captcha_event: None,
+                has_search: None,
+                download_arg_name: None,
+                list_returns_key: None,
+                item_subtitle_field: Some("delivery_name".into()),
+                session_display: None,
+                string_ids: Some(true),
             },
         },
     ]
 }
 
 impl OmnigetPlugin for CoursesPlugin {
-    fn id(&self) -> &str { "courses" }
-    fn name(&self) -> &str { "Course Downloader" }
-    fn version(&self) -> &str { env!("CARGO_PKG_VERSION") }
+    fn id(&self) -> &str {
+        "courses"
+    }
+    fn name(&self) -> &str {
+        "Course Downloader"
+    }
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
 
     fn initialize(&mut self, host: Arc<dyn PluginHost>) -> anyhow::Result<()> {
         if let Some(proxy) = host.proxy_config() {
@@ -242,7 +453,7 @@ impl OmnigetPlugin for CoursesPlugin {
                     port: proxy.port,
                     username: proxy.username.unwrap_or_default(),
                     password: proxy.password.unwrap_or_default(),
-                }
+                },
             );
         }
         self.host = Some(host);
@@ -253,225 +464,357 @@ impl OmnigetPlugin for CoursesPlugin {
         &self,
         command: String,
         args: serde_json::Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static>,
+    > {
         let plugin = self.clone();
         let runtime_handle = self.runtime.handle().clone();
         Box::pin(async move {
-            runtime_handle.spawn(async move {
-            fn get_arg<T: serde::de::DeserializeOwned>(args: &serde_json::Value, key: &str) -> Result<T, String> {
-                serde_json::from_value(
-                    args.get(key).cloned().ok_or_else(|| format!("missing '{}'", key))?
-                ).map_err(|e| format!("invalid '{}': {}", key, e))
-            }
+            runtime_handle
+                .spawn(async move {
+                    fn get_arg<T: serde::de::DeserializeOwned>(
+                        args: &serde_json::Value,
+                        key: &str,
+                    ) -> Result<T, String> {
+                        serde_json::from_value(
+                            args.get(key)
+                                .cloned()
+                                .ok_or_else(|| format!("missing '{}'", key))?,
+                        )
+                        .map_err(|e| format!("invalid '{}': {}", key, e))
+                    }
 
-            match command.as_str() {
-                "hotmart_login" => {
-                    let email: String = get_arg(&args, "email")?;
-                    let password: String = get_arg(&args, "password")?;
-                    let host = plugin.host.clone().ok_or("not initialized")?;
-                    let r = commands::auth::hotmart_login(host, &plugin, email, password).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "hotmart_set_cookies" => {
-                    let cookies_val = args.get("cookies").ok_or("missing 'cookies'")?;
-                    let cookies_json = serde_json::to_string(cookies_val).map_err(|e| e.to_string())?;
-                    let r = commands::auth::hotmart_set_cookies(&plugin, cookies_json).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "hotmart_check_session" => {
-                    let r = commands::auth::hotmart_check_session(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "hotmart_logout" => {
-                    let r = commands::auth::hotmart_logout(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "hotmart_list_courses" => {
-                    let r = commands::courses::hotmart_list_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "hotmart_refresh_courses" => {
-                    let r = commands::courses::hotmart_refresh_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "hotmart_get_modules" => {
-                    let course_id: u64 = get_arg(&args, "courseId")?;
-                    let slug: String = get_arg(&args, "slug")?;
-                    let r = commands::courses::hotmart_get_modules(&plugin, course_id, slug).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "start_course_download" => {
-                    let course_json: String = get_arg(&args, "courseJson")?;
-                    let output_dir: String = get_arg(&args, "outputDir")?;
-                    let host = plugin.host.clone().ok_or("not initialized")?;
-                    let r = commands::downloads::start_course_download(host, &plugin, course_json, output_dir).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "cancel_course_download" => {
-                    let course_id: u64 = get_arg(&args, "courseId")?;
-                    let r = commands::downloads::cancel_course_download(&plugin, course_id).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "get_active_downloads" => {
-                    let r = commands::downloads::get_active_downloads(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_login" => {
-                    let email: String = get_arg(&args, "email")?;
-                    let host = plugin.host.clone().ok_or("not initialized")?;
-                    let r = commands::udemy_auth::udemy_login(host, &plugin, email).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_request_otp" => {
-                    let email: String = get_arg(&args, "email")?;
-                    commands::udemy_auth::udemy_request_otp(email).await?;
-                    serde_json::to_value("otp_sent").map_err(|e| e.to_string())
-                }
-                "udemy_verify_otp" => {
-                    let email: String = get_arg(&args, "email")?;
-                    let otp_code: String = get_arg(&args, "otpCode")?;
-                    let r = commands::udemy_auth::udemy_verify_otp(&plugin, email, otp_code).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_login_cookies" => {
-                    let cookie_json: String = get_arg(&args, "cookieJson")?;
-                    let r = commands::udemy_auth::udemy_login_cookies(&plugin, cookie_json).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_set_cookies" => {
-                    let cookies_val = args.get("cookies").ok_or("missing 'cookies'")?;
-                    let cookies_json = serde_json::to_string(cookies_val).map_err(|e| e.to_string())?;
-                    let r = commands::udemy_auth::udemy_set_cookies(&plugin, cookies_json).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_check_session" => {
-                    let r = commands::udemy_auth::udemy_check_session(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_get_portal" => {
-                    let r = commands::udemy_auth::udemy_get_portal(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_logout" => {
-                    let r = commands::udemy_auth::udemy_logout(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_list_courses" => {
-                    let r = commands::udemy_courses::udemy_list_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_refresh_courses" => {
-                    let r = commands::udemy_courses::udemy_refresh_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "udemy_get_curriculum" => {
-                    let course_id: u64 = get_arg(&args, "courseId")?;
-                    let r = commands::udemy_downloads::udemy_get_curriculum(&plugin, course_id).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "start_udemy_course_download" => {
-                    let course_json: String = get_arg(&args, "courseJson")?;
-                    let output_dir: String = get_arg(&args, "outputDir")?;
-                    let chapter_filter: Option<String> = args
-                        .get("chapterFilter")
-                        .or_else(|| args.get("chapter_filter"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let host = plugin.host.clone().ok_or("not initialized")?;
-                    let r = commands::udemy_downloads::start_udemy_course_download(host, &plugin, course_json, output_dir, chapter_filter).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "cancel_udemy_course_download" => {
-                    let course_id: u64 = get_arg(&args, "courseId")?;
-                    let r = commands::udemy_downloads::cancel_udemy_course_download(&plugin, course_id).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "kiwify_login" => {
-                    let email: String = get_arg(&args, "email")?;
-                    let password: String = get_arg(&args, "password")?;
-                    let r = commands::kiwify::kiwify_login(&plugin, email, password).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "kiwify_login_token" => {
-                    let token: String = get_arg(&args, "token")?;
-                    let r = commands::kiwify::kiwify_login_token(&plugin, token).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "kiwify_check_session" => {
-                    let r = commands::kiwify::kiwify_check_session(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "kiwify_logout" => {
-                    let r = commands::kiwify::kiwify_logout(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "kiwify_list_courses" => {
-                    let r = commands::kiwify::kiwify_list_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "kiwify_refresh_courses" => {
-                    let r = commands::kiwify::kiwify_refresh_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "start_kiwify_course_download" => {
-                    let course_json: String = get_arg(&args, "courseJson")?;
-                    let output_dir: String = get_arg(&args, "outputDir")?;
-                    let host = plugin.host.clone().ok_or("not initialized")?;
-                    let r = commands::kiwify::start_kiwify_course_download(host, &plugin, course_json, output_dir).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "cancel_kiwify_course_download" => {
-                    let course_id: String = get_arg(&args, "courseId")?;
-                    let r = commands::kiwify::cancel_kiwify_course_download(&plugin, &course_id).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "rocketseat_login_token" => {
-                    let token: String = get_arg(&args, "token")?;
-                    let r = commands::rocketseat::rocketseat_login_token(&plugin, token).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "rocketseat_check_session" => {
-                    let r = commands::rocketseat::rocketseat_check_session(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "rocketseat_logout" => {
-                    let r = commands::rocketseat::rocketseat_logout(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "rocketseat_list_courses" => {
-                    let r = commands::rocketseat::rocketseat_list_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "rocketseat_search_courses" => {
-                    let query: String = get_arg(&args, "query")?;
-                    let r = commands::rocketseat::rocketseat_search_courses(&plugin, query).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "rocketseat_refresh_courses" => {
-                    let r = commands::rocketseat::rocketseat_refresh_courses(&plugin).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "start_rocketseat_course_download" => {
-                    let course_json: String = get_arg(&args, "courseJson")?;
-                    let output_dir: String = get_arg(&args, "outputDir")?;
-                    let host = plugin.host.clone().ok_or("not initialized")?;
-                    let r = commands::rocketseat::start_rocketseat_course_download(host, &plugin, course_json, output_dir).await?;
-                    serde_json::to_value(r).map_err(|e| e.to_string())
-                }
-                "get_platforms" => {
-                    let configs = get_all_platform_configs();
-                    serde_json::to_value(configs).map_err(|e| e.to_string())
-                }
-                "get_platform_config" => {
-                    let platform: String = get_arg(&args, "platform")?;
-                    let configs = get_all_platform_configs();
-                    let config = configs.into_iter().find(|c| c.id == platform)
-                        .ok_or_else(|| format!("Unknown platform: {}", platform))?;
-                    serde_json::to_value(config).map_err(|e| e.to_string())
-                }
-                _ => Err(format!("Unknown command: {}", command)),
-            }
-            }).await.map_err(|e| format!("task join error: {}", e))?
+                    match command.as_str() {
+                        "hotmart_login" => {
+                            let email: String = get_arg(&args, "email")?;
+                            let password: String = get_arg(&args, "password")?;
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::auth::hotmart_login(host, &plugin, email, password)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "hotmart_set_cookies" => {
+                            let cookies_val = args.get("cookies").ok_or("missing 'cookies'")?;
+                            let cookies_json = match cookies_val {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).map_err(|e| e.to_string())?,
+                            };
+                            let r =
+                                commands::auth::hotmart_set_cookies(&plugin, cookies_json).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "hotmart_check_session" => {
+                            let r = commands::auth::hotmart_check_session(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "hotmart_logout" => {
+                            let r = commands::auth::hotmart_logout(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "hotmart_list_courses" => {
+                            let r = commands::courses::hotmart_list_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "hotmart_refresh_courses" => {
+                            let r = commands::courses::hotmart_refresh_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "hotmart_get_modules" => {
+                            let course_id: u64 = get_arg(&args, "courseId")?;
+                            let slug: String = get_arg(&args, "slug")?;
+                            let r =
+                                commands::courses::hotmart_get_modules(&plugin, course_id, slug)
+                                    .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "start_course_download" => {
+                            let course_json: String = get_arg(&args, "courseJson")?;
+                            let output_dir: String = get_arg(&args, "outputDir")?;
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::downloads::start_course_download(
+                                host,
+                                &plugin,
+                                course_json,
+                                output_dir,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "cancel_course_download" => {
+                            let course_id: u64 = get_arg(&args, "courseId")?;
+                            let r = commands::downloads::cancel_course_download(&plugin, course_id)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "get_active_downloads" => {
+                            let r = commands::downloads::get_active_downloads(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_login" => {
+                            let email: String = get_arg(&args, "email")?;
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::udemy_auth::udemy_login(host, &plugin, email).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_request_otp" => {
+                            let email: String = get_arg(&args, "email")?;
+                            commands::udemy_auth::udemy_request_otp(email).await?;
+                            serde_json::to_value("otp_sent").map_err(|e| e.to_string())
+                        }
+                        "udemy_verify_otp" => {
+                            let email: String = get_arg(&args, "email")?;
+                            let otp_code: String = get_arg(&args, "otpCode")?;
+                            let r =
+                                commands::udemy_auth::udemy_verify_otp(&plugin, email, otp_code)
+                                    .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_login_cookies" => {
+                            let cookie_json: String = get_arg(&args, "cookieJson")?;
+                            let r = commands::udemy_auth::udemy_login_cookies(&plugin, cookie_json)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_set_cookies" => {
+                            let cookies_val = args.get("cookies").ok_or("missing 'cookies'")?;
+                            let cookies_json =
+                                serde_json::to_string(cookies_val).map_err(|e| e.to_string())?;
+                            let r = commands::udemy_auth::udemy_set_cookies(&plugin, cookies_json)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_check_session" => {
+                            let r = commands::udemy_auth::udemy_check_session(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_get_portal" => {
+                            let r = commands::udemy_auth::udemy_get_portal(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_logout" => {
+                            let r = commands::udemy_auth::udemy_logout(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_list_courses" => {
+                            let r = commands::udemy_courses::udemy_list_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_refresh_courses" => {
+                            let r = commands::udemy_courses::udemy_refresh_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "start_udemy_course_download" => {
+                            let course_json: String = get_arg(&args, "courseJson")?;
+                            let output_dir: String = get_arg(&args, "outputDir")?;
+                            let chapter_filter: Option<String> = args
+                                .get("chapterFilter")
+                                .or_else(|| args.get("chapter_filter"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let section_ids: Option<Vec<u64>> =
+                                match args.get("sectionIds").or_else(|| args.get("section_ids")) {
+                                    Some(v) if !v.is_null() => Some(
+                                        serde_json::from_value(v.clone())
+                                            .map_err(|e| format!("invalid 'sectionIds': {}", e))?,
+                                    ),
+                                    _ => None,
+                                };
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::udemy_downloads::start_udemy_course_download(
+                                host,
+                                &plugin,
+                                course_json,
+                                output_dir,
+                                chapter_filter,
+                                section_ids,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "udemy_get_curriculum" => {
+                            let course_id: u64 = get_arg(&args, "courseId")?;
+                            let r =
+                                commands::udemy_downloads::udemy_get_curriculum(&plugin, course_id)
+                                    .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "cancel_udemy_course_download" => {
+                            let course_id: u64 = get_arg(&args, "courseId")?;
+                            let r = commands::udemy_downloads::cancel_udemy_course_download(
+                                &plugin, course_id,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "kiwify_login" => {
+                            let email: String = get_arg(&args, "email")?;
+                            let password: String = get_arg(&args, "password")?;
+                            let r =
+                                commands::kiwify::kiwify_login(&plugin, email, password).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "kiwify_login_token" => {
+                            let token: String = get_arg(&args, "token")?;
+                            let r = commands::kiwify::kiwify_login_token(&plugin, token).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "kiwify_check_session" => {
+                            let r = commands::kiwify::kiwify_check_session(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "kiwify_logout" => {
+                            let r = commands::kiwify::kiwify_logout(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "kiwify_list_courses" => {
+                            let r = commands::kiwify::kiwify_list_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "kiwify_refresh_courses" => {
+                            let r = commands::kiwify::kiwify_refresh_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "start_kiwify_course_download" => {
+                            let course_json: String = get_arg(&args, "courseJson")?;
+                            let output_dir: String = get_arg(&args, "outputDir")?;
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::kiwify::start_kiwify_course_download(
+                                host,
+                                &plugin,
+                                course_json,
+                                output_dir,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "cancel_kiwify_course_download" => {
+                            let course_id: String = get_arg(&args, "courseId")?;
+                            let r = commands::kiwify::cancel_kiwify_course_download(
+                                &plugin, &course_id,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_login_token" => {
+                            let token: String = get_arg(&args, "token")?;
+                            let r = commands::rocketseat::rocketseat_login_token(&plugin, token)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_set_cookies" => {
+                            let cookies_val = args.get("cookies").ok_or("missing 'cookies'")?;
+                            let cookies_json = match cookies_val {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).map_err(|e| e.to_string())?,
+                            };
+                            let r =
+                                commands::rocketseat::rocketseat_set_cookies(&plugin, cookies_json)
+                                    .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_check_session" => {
+                            let r = commands::rocketseat::rocketseat_check_session(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_logout" => {
+                            let r = commands::rocketseat::rocketseat_logout(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_list_courses" => {
+                            let r = commands::rocketseat::rocketseat_list_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_search_courses" => {
+                            let query: String = get_arg(&args, "query")?;
+                            let r = commands::rocketseat::rocketseat_search_courses(&plugin, query)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "rocketseat_refresh_courses" => {
+                            let r =
+                                commands::rocketseat::rocketseat_refresh_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "start_rocketseat_course_download" => {
+                            let course_json: String = get_arg(&args, "courseJson")?;
+                            let output_dir: String = get_arg(&args, "outputDir")?;
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::rocketseat::start_rocketseat_course_download(
+                                host,
+                                &plugin,
+                                course_json,
+                                output_dir,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "metaanalysis_login" => {
+                            let email: String = get_arg(&args, "email")?;
+                            let password: String = get_arg(&args, "password")?;
+                            let r = commands::metaanalysis::metaanalysis_login(
+                                &plugin, email, password,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "metaanalysis_check_session" => {
+                            let r =
+                                commands::metaanalysis::metaanalysis_check_session(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "metaanalysis_logout" => {
+                            let r = commands::metaanalysis::metaanalysis_logout(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "metaanalysis_list_courses" => {
+                            let r =
+                                commands::metaanalysis::metaanalysis_list_courses(&plugin).await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "metaanalysis_refresh_courses" => {
+                            let r = commands::metaanalysis::metaanalysis_refresh_courses(&plugin)
+                                .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "start_metaanalysis_course_download" => {
+                            let course_json: String = get_arg(&args, "courseJson")?;
+                            let output_dir: String = get_arg(&args, "outputDir")?;
+                            let host = plugin.host.clone().ok_or("not initialized")?;
+                            let r = commands::metaanalysis::start_metaanalysis_course_download(
+                                host,
+                                &plugin,
+                                course_json,
+                                output_dir,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "cancel_metaanalysis_course_download" => {
+                            let course_id: String = get_arg(&args, "courseId")?;
+                            let r = commands::metaanalysis::cancel_metaanalysis_course_download(
+                                &plugin, &course_id,
+                            )
+                            .await?;
+                            serde_json::to_value(r).map_err(|e| e.to_string())
+                        }
+                        "get_platforms" => {
+                            let configs = get_all_platform_configs();
+                            serde_json::to_value(configs).map_err(|e| e.to_string())
+                        }
+                        "get_platform_config" => {
+                            let platform: String = get_arg(&args, "platform")?;
+                            let configs = get_all_platform_configs();
+                            let config = configs
+                                .into_iter()
+                                .find(|c| c.id == platform)
+                                .ok_or_else(|| format!("Unknown platform: {}", platform))?;
+                            serde_json::to_value(config).map_err(|e| e.to_string())
+                        }
+                        _ => Err(format!("Unknown command: {}", command)),
+                    }
+                })
+                .await
+                .map_err(|e| format!("task join error: {}", e))?
         })
     }
 
@@ -497,9 +840,9 @@ impl OmnigetPlugin for CoursesPlugin {
             "udemy_logout".into(),
             "udemy_list_courses".into(),
             "udemy_refresh_courses".into(),
-            "udemy_get_curriculum".into(),
             "start_udemy_course_download".into(),
             "cancel_udemy_course_download".into(),
+            "udemy_get_curriculum".into(),
             "kiwify_login".into(),
             "kiwify_login_token".into(),
             "kiwify_check_session".into(),
@@ -509,12 +852,20 @@ impl OmnigetPlugin for CoursesPlugin {
             "start_kiwify_course_download".into(),
             "cancel_kiwify_course_download".into(),
             "rocketseat_login_token".into(),
+            "rocketseat_set_cookies".into(),
             "rocketseat_check_session".into(),
             "rocketseat_logout".into(),
             "rocketseat_list_courses".into(),
             "rocketseat_search_courses".into(),
             "rocketseat_refresh_courses".into(),
             "start_rocketseat_course_download".into(),
+            "metaanalysis_login".into(),
+            "metaanalysis_check_session".into(),
+            "metaanalysis_logout".into(),
+            "metaanalysis_list_courses".into(),
+            "metaanalysis_refresh_courses".into(),
+            "start_metaanalysis_course_download".into(),
+            "cancel_metaanalysis_course_download".into(),
             "get_platforms".into(),
             "get_platform_config".into(),
         ]
@@ -529,8 +880,43 @@ mod tests {
     fn advertises_udemy_curriculum_command() {
         let plugin = CoursesPlugin::new();
 
-        assert!(plugin.commands().iter().any(|command| command == "udemy_get_curriculum"));
+        assert!(plugin
+            .commands()
+            .iter()
+            .any(|command| command == "udemy_get_curriculum"));
     }
 }
 
 omniget_plugin_sdk::export_plugin!(CoursesPlugin::new());
+
+#[cfg(test)]
+mod platform_config_tests {
+    use super::*;
+
+    #[test]
+    fn every_advertised_command_is_registered() {
+        let plugin = CoursesPlugin::new();
+        let registered = plugin.commands();
+        for config in get_all_platform_configs() {
+            let mut referenced = vec![
+                config.commands.check_session.clone(),
+                config.commands.logout.clone(),
+                config.commands.list.clone(),
+                config.commands.refresh.clone(),
+                config.commands.download.clone(),
+            ];
+            referenced.extend(config.commands.cancel.iter().cloned());
+            referenced.extend(config.commands.search.iter().cloned());
+            referenced.extend(config.commands.curriculum.iter().cloned());
+            referenced.extend(config.login_methods.iter().map(|m| m.command.clone()));
+            for cmd in referenced {
+                assert!(
+                    registered.contains(&cmd),
+                    "platform '{}' advertises '{}' but commands() does not register it",
+                    config.id,
+                    cmd
+                );
+            }
+        }
+    }
+}

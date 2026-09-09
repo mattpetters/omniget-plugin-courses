@@ -9,11 +9,11 @@ use futures::stream::{self, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::platforms::traits::{PlatformDownloader, ProgressUpdate};
 use omniget_core::core::filename;
 use omniget_core::core::media_processor::MediaProcessor;
 use omniget_core::models::media::{DownloadOptions, DownloadResult, MediaInfo, MediaType};
 use omniget_core::models::settings::{self, DownloadSettings};
-use crate::platforms::traits::{PlatformDownloader, ProgressUpdate};
 
 use super::api::{self, Course, Lesson};
 use super::auth::HotmartSession;
@@ -109,14 +109,15 @@ impl HotmartDownloader {
         max_retries: u32,
         concurrent_fragments: u32,
     ) -> Self {
-        let hls_client = omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
-            .danger_accept_invalid_certs(true)
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(300))
-            .pool_max_idle_per_host(50)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build HLS client with static config");
+        let hls_client =
+            omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
+                .danger_accept_invalid_certs(true)
+                .connect_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(300))
+                .pool_max_idle_per_host(50)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .build()
+                .expect("Failed to build HLS client with static config");
 
         Self {
             session,
@@ -149,119 +150,152 @@ impl HotmartDownloader {
 
         std::fs::create_dir_all(output_dir)?;
 
+        let max_height = crate::platforms::udemy::downloader::parse_quality_pref(
+            &self.download_settings.video_quality,
+        );
+
         if lesson.has_media {
             let prefix = self.filename_prefix().to_string();
-            let media_futures: Vec<_> = lesson.medias.iter().enumerate().map(|(i, media)| {
-                let media = media.clone();
-                let session = session.clone();
-                let output_dir = output_dir.to_string();
-                let bytes_tx = bytes_tx.clone();
-                let cancel_token = cancel_token.clone();
-                let hls_client = self.hls_client.clone();
-                let max_concurrent_segments = self.max_concurrent_segments;
-                let max_retries = self.max_retries;
-                let prefix = prefix.clone();
+            let media_futures: Vec<_> = lesson
+                .medias
+                .iter()
+                .enumerate()
+                .map(|(i, media)| {
+                    let media = media.clone();
+                    let session = session.clone();
+                    let output_dir = output_dir.to_string();
+                    let bytes_tx = bytes_tx.clone();
+                    let cancel_token = cancel_token.clone();
+                    let hls_client = self.hls_client.clone();
+                    let max_concurrent_segments = self.max_concurrent_segments;
+                    let max_retries = self.max_retries;
+                    let prefix = prefix.clone();
 
-                async move {
-                    let mut paths: Vec<PathBuf> = Vec::new();
+                    async move {
+                        let mut paths: Vec<PathBuf> = Vec::new();
 
-                    if cancel_token.is_cancelled() {
-                        return paths;
-                    }
-
-                    let assets = match parser::fetch_player_media_assets(&media.url, &session).await {
-                        Ok(a) => a,
-                        Err(_) => return paths,
-                    };
-
-                    if media.media_type.to_uppercase().contains("VIDEO") {
-                        let m3u8_url = match assets.first().and_then(|a| a.get("url")).and_then(|v| v.as_str()) {
-                            Some(url) => url.to_string(),
-                            None => return paths,
-                        };
-
-                        let out = format!("{}/{}{}. Aula.mp4", output_dir, prefix, i + 1);
-
-                        if is_hls_file_valid(&out).await {
+                        if cancel_token.is_cancelled() {
                             return paths;
                         }
 
-                        if done_path(&out).exists() {
-                            let _ = std::fs::remove_file(&out);
-                            let _ = std::fs::remove_file(done_path(&out));
-                        }
-
-                        let hls_result = retry_hls_download(
-                            &m3u8_url,
-                            &out,
-                            "https://cf-embed.play.hotmart.com/",
-                            Some(bytes_tx.clone()),
-                            &cancel_token,
-                            max_concurrent_segments,
-                            max_retries,
-                            3,
-                            Some(hls_client),
-                        )
-                        .await;
-
-                        match hls_result {
-                            Ok(hls_result) => {
-                                let _ = write_done_manifest(&out, hls_result.file_size, hls_result.segments).await;
-                                paths.push(hls_result.path);
-                            }
-                            Err(e) => {
-                                tracing::error!("[download] Falha ao baixar vídeo '{}': {}", out, e);
-                                let _ = std::fs::remove_file(&out);
-                            }
-                        }
-                    } else if media.media_type.to_uppercase().contains("AUDIO") {
-                        for asset in &assets {
-                            let content_type = asset
-                                .get("contentType")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !content_type.to_lowercase().contains("audio") {
-                                continue;
-                            }
-                            let audio_url = match asset.get("url").and_then(|v| v.as_str()) {
-                                Some(url) => url,
-                                None => continue,
+                        let assets =
+                            match parser::fetch_player_media_assets(&media.url, &session).await {
+                                Ok(a) => a,
+                                Err(_) => return paths,
                             };
 
-                            let safe_name = filename::sanitize_path_component(&media.name);
-                            let out = format!(
-                                "{}/{}{}. {}",
-                                output_dir,
-                                prefix,
-                                i + 1,
-                                if safe_name.is_empty() { "Audio.mp4".to_string() } else { safe_name }
-                            );
+                        if media.media_type.to_uppercase().contains("VIDEO") {
+                            let m3u8_url = match assets
+                                .first()
+                                .and_then(|a| a.get("url"))
+                                .and_then(|v| v.as_str())
+                            {
+                                Some(url) => url.to_string(),
+                                None => return paths,
+                            };
 
-                            if std::path::Path::new(&out).exists() {
-                                let meta = std::fs::metadata(&out);
-                                if meta.map(|m| m.len() > 0).unwrap_or(false) {
-                                    continue;
+                            let out = format!("{}/{}{}. Aula.mp4", output_dir, prefix, i + 1);
+
+                            if is_hls_file_valid(&out).await {
+                                return paths;
+                            }
+
+                            if done_path(&out).exists() {
+                                let _ = std::fs::remove_file(&out);
+                                let _ = std::fs::remove_file(done_path(&out));
+                            }
+
+                            let hls_result = retry_hls_download(
+                                &m3u8_url,
+                                &out,
+                                "https://cf-embed.play.hotmart.com/",
+                                Some(bytes_tx.clone()),
+                                &cancel_token,
+                                max_concurrent_segments,
+                                max_retries,
+                                3,
+                                Some(hls_client),
+                                max_height,
+                            )
+                            .await;
+
+                            match hls_result {
+                                Ok(hls_result) => {
+                                    let _ = write_done_manifest(
+                                        &out,
+                                        hls_result.file_size,
+                                        hls_result.segments,
+                                    )
+                                    .await;
+                                    paths.push(hls_result.path);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "[download] Falha ao baixar vídeo '{}': {}",
+                                        out,
+                                        e
+                                    );
+                                    let _ = std::fs::remove_file(&out);
                                 }
                             }
+                        } else if media.media_type.to_uppercase().contains("AUDIO") {
+                            for asset in &assets {
+                                let content_type = asset
+                                    .get("contentType")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if !content_type.to_lowercase().contains("audio") {
+                                    continue;
+                                }
+                                let audio_url = match asset.get("url").and_then(|v| v.as_str()) {
+                                    Some(url) => url,
+                                    None => continue,
+                                };
 
-                            match session.client.get(audio_url).send().await {
-                                Ok(resp) => match resp.bytes().await {
-                                    Ok(bytes) => {
-                                        let _ = bytes_tx.send(bytes.len() as u64);
-                                        if std::fs::write(&out, &bytes).is_ok() {
-                                            paths.push(PathBuf::from(out));
-                                        }
+                                let safe_name = filename::sanitize_path_component(&media.name);
+                                let out = format!(
+                                    "{}/{}{}. {}",
+                                    output_dir,
+                                    prefix,
+                                    i + 1,
+                                    if safe_name.is_empty() {
+                                        "Audio.mp4".to_string()
+                                    } else {
+                                        safe_name
                                     }
-                                    Err(e) => tracing::error!("[download] Falha ao baixar áudio: {}", e),
-                                },
-                                Err(e) => tracing::error!("[download] Falha ao baixar áudio: {}", e),
+                                );
+
+                                if std::path::Path::new(&out).exists() {
+                                    let meta = std::fs::metadata(&out);
+                                    if meta.map(|m| m.len() > 0).unwrap_or(false) {
+                                        continue;
+                                    }
+                                }
+
+                                match session.client.get(audio_url).send().await {
+                                    Ok(resp) => match resp.bytes().await {
+                                        Ok(bytes) => {
+                                            let _ = bytes_tx.send(bytes.len() as u64);
+                                            if std::fs::write(&out, &bytes).is_ok() {
+                                                paths.push(PathBuf::from(out));
+                                            }
+                                        }
+                                        Err(e) => tracing::error!(
+                                            "[download] Falha ao baixar áudio: {}",
+                                            e
+                                        ),
+                                    },
+                                    Err(e) => {
+                                        tracing::error!("[download] Falha ao baixar áudio: {}", e)
+                                    }
+                                }
                             }
                         }
-                    }
 
-                    paths
-                }
-            }).collect();
+                        paths
+                    }
+                })
+                .collect();
 
             let all_media_results = futures::future::join_all(media_futures).await;
             for media_result in all_media_results {
@@ -272,154 +306,181 @@ impl HotmartDownloader {
         if let Some(html) = &lesson.content {
             let players = parser::detect_players_from_html(html);
             let prefix2 = self.filename_prefix().to_string();
-            let player_futures: Vec<_> = players.into_iter().enumerate().map(|(i, player)| {
-                let bytes_tx = bytes_tx.clone();
-                let cancel_token = cancel_token.clone();
-                let hls_client = self.hls_client.clone();
-                let max_concurrent_segments = self.max_concurrent_segments;
-                let max_retries = self.max_retries;
-                let concurrent_fragments = self.concurrent_fragments;
-                let output_dir = output_dir.to_string();
-                let referer = referer.to_string();
-                let prefix = prefix2.clone();
+            let player_futures: Vec<_> = players
+                .into_iter()
+                .enumerate()
+                .map(|(i, player)| {
+                    let bytes_tx = bytes_tx.clone();
+                    let cancel_token = cancel_token.clone();
+                    let hls_client = self.hls_client.clone();
+                    let max_concurrent_segments = self.max_concurrent_segments;
+                    let max_retries = self.max_retries;
+                    let concurrent_fragments = self.concurrent_fragments;
+                    let output_dir = output_dir.to_string();
+                    let referer = referer.to_string();
+                    let prefix = prefix2.clone();
 
-                async move {
-                    let mut paths: Vec<PathBuf> = Vec::new();
+                    async move {
+                        let mut paths: Vec<PathBuf> = Vec::new();
 
-                    if cancel_token.is_cancelled() {
-                        return paths;
-                    }
+                        if cancel_token.is_cancelled() {
+                            return paths;
+                        }
 
-                    let out = format!("{}/{}{}. Aula.mp4", output_dir, prefix, i + 1);
+                        let out = format!("{}/{}{}. Aula.mp4", output_dir, prefix, i + 1);
 
-                    match player {
-                        DetectedPlayer::Vimeo { embed_url } => {
-                            if std::path::Path::new(&out).exists() {
-                                let meta = std::fs::metadata(&out);
-                                if meta.map(|m| m.len() > 0).unwrap_or(false) {
-                                    return paths;
-                                }
-                            }
-
-                            match omniget_core::core::ytdlp::ensure_ytdlp().await {
-                                Ok(ytdlp_path) => {
-                                    let out_dir = std::path::Path::new(&out).parent()
-                                        .unwrap_or(std::path::Path::new("."));
-                                    let (vtx, _vrx) = mpsc::channel(8);
-                                    match omniget_core::core::ytdlp::download_video(
-                                        &ytdlp_path,
-                                        &embed_url,
-                                        out_dir,
-                                        None,
-                                        vtx,
-                                        None,
-                                        None,
-                                        None,
-                                        Some(&referer),
-                                        cancel_token.clone(),
-                                        None,
-                                        concurrent_fragments,
-                                        false,
-                                        &[],
-                                        None,
-                                        false,
-                                    ).await {
-                                        Ok(result) => {
-                                            let _ = bytes_tx.send(result.file_size_bytes);
-                                            paths.push(result.file_path);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("[download] Falha Vimeo: {}", e);
-                                            cleanup_part_files(out_dir).await;
-                                        }
+                        match player {
+                            DetectedPlayer::Vimeo { embed_url } => {
+                                if std::path::Path::new(&out).exists() {
+                                    let meta = std::fs::metadata(&out);
+                                    if meta.map(|m| m.len() > 0).unwrap_or(false) {
+                                        return paths;
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!("[download] yt-dlp indisponível para Vimeo: {}", e);
+
+                                match omniget_core::core::ytdlp::ensure_ytdlp().await {
+                                    Ok(ytdlp_path) => {
+                                        let out_dir = std::path::Path::new(&out)
+                                            .parent()
+                                            .unwrap_or(std::path::Path::new("."));
+                                        let (vtx, _vrx) = mpsc::channel(8);
+                                        match omniget_core::core::ytdlp::download_video(
+                                            &ytdlp_path,
+                                            &embed_url,
+                                            out_dir,
+                                            None,
+                                            vtx,
+                                            None,
+                                            None,
+                                            None,
+                                            Some(&referer),
+                                            cancel_token.clone(),
+                                            None,
+                                            concurrent_fragments,
+                                            false,
+                                            &[],
+                                            None,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => {
+                                                let _ = bytes_tx.send(result.file_size_bytes);
+                                                paths.push(result.file_path);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("[download] Falha Vimeo: {}", e);
+                                                cleanup_part_files(out_dir).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "[download] yt-dlp indisponível para Vimeo: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        DetectedPlayer::PandaVideo { m3u8_url, .. } => {
-                            if is_hls_file_valid(&out).await {
-                                return paths;
-                            }
-
-                            if done_path(&out).exists() {
-                                let _ = std::fs::remove_file(&out);
-                                let _ = std::fs::remove_file(done_path(&out));
-                            }
-
-                            let panda_referer = m3u8_url
-                                .split("com.br")
-                                .next()
-                                .unwrap_or("")
-                                .to_string()
-                                + "com.br";
-                            match retry_hls_download(&m3u8_url, &out, &panda_referer, Some(bytes_tx.clone()), &cancel_token, max_concurrent_segments, max_retries, 3, Some(hls_client)).await {
-                                Ok(hls_result) => {
-                                    let _ = write_done_manifest(&out, hls_result.file_size, hls_result.segments).await;
-                                    paths.push(hls_result.path);
+                            DetectedPlayer::PandaVideo { m3u8_url, .. } => {
+                                if is_hls_file_valid(&out).await {
+                                    return paths;
                                 }
-                                Err(e) => {
-                                    tracing::error!("[download] Falha PandaVideo: {}", e);
+
+                                if done_path(&out).exists() {
                                     let _ = std::fs::remove_file(&out);
+                                    let _ = std::fs::remove_file(done_path(&out));
                                 }
-                            }
-                        }
-                        DetectedPlayer::YouTube { video_id, .. } => {
-                            if std::path::Path::new(&out).exists() {
-                                let meta = std::fs::metadata(&out);
-                                if meta.map(|m| m.len() > 0).unwrap_or(false) {
-                                    return paths;
-                                }
-                            }
 
-                            let yt_url = format!("https://www.youtube.com/watch?v={}", video_id);
-                            match omniget_core::core::ytdlp::ensure_ytdlp().await {
-                                Ok(ytdlp_path) => {
-                                    let out_dir = std::path::Path::new(&out).parent()
-                                        .unwrap_or(std::path::Path::new("."));
-                                    let (ytx, _yrx) = mpsc::channel(8);
-                                    match omniget_core::core::ytdlp::download_video(
-                                        &ytdlp_path,
-                                        &yt_url,
-                                        out_dir,
-                                        None,
-                                        ytx,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        cancel_token.clone(),
-                                        None,
-                                        concurrent_fragments,
-                                        false,
-                                        &[],
-                                        None,
-                                        false,
-                                    ).await {
-                                        Ok(result) => {
-                                            let _ = bytes_tx.send(result.file_size_bytes);
-                                            paths.push(result.file_path);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("[download] Falha YouTube: {}", e);
-                                            cleanup_part_files(out_dir).await;
-                                        }
+                                let panda_referer =
+                                    m3u8_url.split("com.br").next().unwrap_or("").to_string()
+                                        + "com.br";
+                                match retry_hls_download(
+                                    &m3u8_url,
+                                    &out,
+                                    &panda_referer,
+                                    Some(bytes_tx.clone()),
+                                    &cancel_token,
+                                    max_concurrent_segments,
+                                    max_retries,
+                                    3,
+                                    Some(hls_client),
+                                    max_height,
+                                )
+                                .await
+                                {
+                                    Ok(hls_result) => {
+                                        let _ = write_done_manifest(
+                                            &out,
+                                            hls_result.file_size,
+                                            hls_result.segments,
+                                        )
+                                        .await;
+                                        paths.push(hls_result.path);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("[download] Falha PandaVideo: {}", e);
+                                        let _ = std::fs::remove_file(&out);
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!("[download] yt-dlp indisponível: {}", e);
+                            }
+                            DetectedPlayer::YouTube { video_id, .. } => {
+                                if std::path::Path::new(&out).exists() {
+                                    let meta = std::fs::metadata(&out);
+                                    if meta.map(|m| m.len() > 0).unwrap_or(false) {
+                                        return paths;
+                                    }
+                                }
+
+                                let yt_url =
+                                    format!("https://www.youtube.com/watch?v={}", video_id);
+                                match omniget_core::core::ytdlp::ensure_ytdlp().await {
+                                    Ok(ytdlp_path) => {
+                                        let out_dir = std::path::Path::new(&out)
+                                            .parent()
+                                            .unwrap_or(std::path::Path::new("."));
+                                        let (ytx, _yrx) = mpsc::channel(8);
+                                        match omniget_core::core::ytdlp::download_video(
+                                            &ytdlp_path,
+                                            &yt_url,
+                                            out_dir,
+                                            None,
+                                            ytx,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            cancel_token.clone(),
+                                            None,
+                                            concurrent_fragments,
+                                            false,
+                                            &[],
+                                            None,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => {
+                                                let _ = bytes_tx.send(result.file_size_bytes);
+                                                paths.push(result.file_path);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("[download] Falha YouTube: {}", e);
+                                                cleanup_part_files(out_dir).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("[download] yt-dlp indisponível: {}", e);
+                                    }
                                 }
                             }
+                            DetectedPlayer::HotmartNative { .. } => {}
+                            DetectedPlayer::Unknown { .. } => {}
                         }
-                        DetectedPlayer::HotmartNative { .. } => {}
-                        DetectedPlayer::Unknown { .. } => {}
-                    }
 
-                    paths
-                }
-            }).collect();
+                        paths
+                    }
+                })
+                .collect();
 
             let all_player_results = futures::future::join_all(player_futures).await;
             for player_result in all_player_results {
@@ -435,22 +496,26 @@ impl HotmartDownloader {
             let mat_dir = format!("{}/Materiais", output_dir);
             std::fs::create_dir_all(&mat_dir)?;
 
-            let att_futures: Vec<_> = lesson.attachments.iter().map(|att| {
-                let session = session.clone();
-                let safe_name = filename::sanitize_path_component(&att.file_name);
-                let att_path = format!("{}/{}", mat_dir, safe_name);
-                let file_membership_id = att.file_membership_id.clone();
+            let att_futures: Vec<_> = lesson
+                .attachments
+                .iter()
+                .map(|att| {
+                    let session = session.clone();
+                    let safe_name = filename::sanitize_path_component(&att.file_name);
+                    let att_path = format!("{}/{}", mat_dir, safe_name);
+                    let file_membership_id = att.file_membership_id.clone();
 
-                async move {
-                    if std::path::Path::new(&att_path).exists() {
-                        return None;
+                    async move {
+                        if std::path::Path::new(&att_path).exists() {
+                            return None;
+                        }
+                        match download_attachment(&session, &file_membership_id, &att_path).await {
+                            Ok(()) => Some(PathBuf::from(att_path)),
+                            Err(_) => None,
+                        }
                     }
-                    match download_attachment(&session, &file_membership_id, &att_path).await {
-                        Ok(()) => Some(PathBuf::from(att_path)),
-                        Err(_) => None,
-                    }
-                }
-            }).collect();
+                })
+                .collect();
 
             let att_results = futures::future::join_all(att_futures).await;
             for path in att_results.into_iter().flatten() {
@@ -515,7 +580,10 @@ impl HotmartDownloader {
         let modules = api::get_modules(&session, slug, course.id).await?;
 
         if modules.is_empty() {
-            return Err(anyhow!("'{}' has no modules available for download", course.name));
+            return Err(anyhow!(
+                "'{}' has no modules available for download",
+                course.name
+            ));
         }
 
         let course_dir = format!(
@@ -598,28 +666,33 @@ impl HotmartDownloader {
                         return;
                     }
 
-                    let lesson = match api::get_lesson(&session, &slug, course_id, &task.page_hash).await {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::error!("Falha ao carregar lição '{}': {}. Continuando...", task.page_name, e);
-                            let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
-                            let _ = progress
-                                .send(CourseDownloadProgress {
-                                    course_id,
-                                    course_name,
-                                    percent: completed as f64 / total_pages as f64 * 100.0,
-                                    current_module: task.module_name,
-                                    current_page: task.page_name,
-                                    downloaded_bytes: total_bytes.load(Ordering::Relaxed),
-                                    total_pages: total_pages as u32,
-                                    completed_pages: completed as u32,
-                                    total_modules: total_modules as u32,
-                                    current_module_index: (task.module_index + 1) as u32,
-                                })
-                                .await;
-                            return;
-                        }
-                    };
+                    let lesson =
+                        match api::get_lesson(&session, &slug, course_id, &task.page_hash).await {
+                            Ok(l) => l,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Falha ao carregar lição '{}': {}. Continuando...",
+                                    task.page_name,
+                                    e
+                                );
+                                let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                                let _ = progress
+                                    .send(CourseDownloadProgress {
+                                        course_id,
+                                        course_name,
+                                        percent: completed as f64 / total_pages as f64 * 100.0,
+                                        current_module: task.module_name,
+                                        current_page: task.page_name,
+                                        downloaded_bytes: total_bytes.load(Ordering::Relaxed),
+                                        total_pages: total_pages as u32,
+                                        completed_pages: completed as u32,
+                                        total_modules: total_modules as u32,
+                                        current_module_index: (task.module_index + 1) as u32,
+                                    })
+                                    .await;
+                                return;
+                            }
+                        };
 
                     let (lesson_bytes_tx, mut lesson_bytes_rx) =
                         tokio::sync::mpsc::unbounded_channel::<u64>();
@@ -631,7 +704,14 @@ impl HotmartDownloader {
                     });
 
                     let lesson_result = downloader
-                        .download_lesson(&session, &lesson, &task.page_dir, &referer, lesson_bytes_tx, &cancel_token)
+                        .download_lesson(
+                            &session,
+                            &lesson,
+                            &task.page_dir,
+                            &referer,
+                            lesson_bytes_tx,
+                            &cancel_token,
+                        )
                         .await;
 
                     let _ = accumulator.await;
@@ -684,13 +764,14 @@ async fn retry_hls_download(
     max_retries: u32,
     max_attempts: u32,
     hls_client: Option<reqwest::Client>,
+    max_height: Option<u32>,
 ) -> anyhow::Result<omniget_core::core::hls_downloader::HlsDownloadResult> {
     let mut last_err = None;
     for attempt in 0..max_attempts {
         if cancel_token.is_cancelled() {
             anyhow::bail!("Download cancelled by user");
         }
-        match MediaProcessor::download_hls(
+        match MediaProcessor::download_hls_with_quality(
             m3u8_url,
             output_path,
             referer,
@@ -699,6 +780,7 @@ async fn retry_hls_download(
             max_concurrent_segments,
             max_retries,
             hls_client.clone(),
+            max_height,
         )
         .await
         {
@@ -760,7 +842,10 @@ async fn download_attachment(
 
     if !info.is_drm {
         if info.url.is_empty() {
-            return Err(anyhow!("URL de download vazia para attachment {}", file_membership_id));
+            return Err(anyhow!(
+                "URL de download vazia para attachment {}",
+                file_membership_id
+            ));
         }
         let bytes = reqwest::get(&info.url).await?.bytes().await?;
         std::fs::write(output_path, &bytes)?;
@@ -785,7 +870,9 @@ async fn download_attachment(
             .await?;
 
         if signed_url.is_empty() || signed_url.contains("500") {
-            return Err(anyhow!("DRM attachment unavailable (empty response or error 500)"));
+            return Err(anyhow!(
+                "DRM attachment unavailable (empty response or error 500)"
+            ));
         }
 
         let bytes = reqwest::get(&signed_url).await?.bytes().await?;
@@ -835,6 +922,8 @@ impl PlatformDownloader for HotmartDownloader {
         _opts: &DownloadOptions,
         _progress: mpsc::Sender<ProgressUpdate>,
     ) -> anyhow::Result<DownloadResult> {
-        Err(anyhow!("Hotmart downloads use start_course_download, not the generic download trait"))
+        Err(anyhow!(
+            "Hotmart downloads use start_course_download, not the generic download trait"
+        ))
     }
 }

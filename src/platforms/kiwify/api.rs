@@ -5,10 +5,12 @@ use anyhow::anyhow;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0";
+const USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0";
 const CDN_BASE: &str = "https://d3pjuhbfoxhm7c.cloudfront.net";
 const FIREBASE_AUTH_KEY: &str = "AIzaSyDmOO1YAGt0X35zykOMTlolvsoBkefLKFU";
-const FIREBASE_AUTH_ENDPOINT: &str = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword";
+const FIREBASE_AUTH_ENDPOINT: &str =
+    "https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword";
 
 #[derive(Clone)]
 pub struct KiwifySession {
@@ -70,8 +72,14 @@ fn build_client(token: &str) -> anyhow::Result<reqwest::Client> {
         "Authorization",
         HeaderValue::from_str(&format!("Bearer {}", token))?,
     );
-    headers.insert("Accept", HeaderValue::from_static("application/json, text/plain, */*"));
-    headers.insert("accept-language", HeaderValue::from_static("pt-BR,pt;q=0.9"));
+    headers.insert(
+        "Accept",
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    headers.insert(
+        "accept-language",
+        HeaderValue::from_static("pt-BR,pt;q=0.9"),
+    );
     headers.insert(
         "Origin",
         HeaderValue::from_static("https://dashboard.kiwify.com"),
@@ -93,17 +101,19 @@ fn build_client(token: &str) -> anyhow::Result<reqwest::Client> {
 }
 
 fn session_file_path() -> anyhow::Result<PathBuf> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| anyhow!("Could not find app data directory"))?;
-    Ok(data_dir.join("wtf.tonho.omniget").join("kiwify_session.json"))
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Could not find app data directory"))?;
+    Ok(data_dir
+        .join("wtf.tonho.omniget")
+        .join("kiwify_session.json"))
 }
 
 pub async fn authenticate(email: &str, password: &str) -> anyhow::Result<KiwifySession> {
-    let temp_client = omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
-        .user_agent(USER_AGENT)
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(60))
-        .build()?;
+    let temp_client =
+        omniget_core::core::http_client::apply_global_proxy(reqwest::Client::builder())
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
+            .build()?;
 
     let payload = serde_json::json!({
         "email": email,
@@ -112,7 +122,10 @@ pub async fn authenticate(email: &str, password: &str) -> anyhow::Result<KiwifyS
     });
 
     let resp = temp_client
-        .post(format!("{}?key={}", FIREBASE_AUTH_ENDPOINT, FIREBASE_AUTH_KEY))
+        .post(format!(
+            "{}?key={}",
+            FIREBASE_AUTH_ENDPOINT, FIREBASE_AUTH_KEY
+        ))
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -173,7 +186,12 @@ pub async fn list_courses(session: &KiwifySession) -> anyhow::Result<Vec<KiwifyC
         let status = resp.status();
         let body_text = resp.text().await?;
 
-        tracing::info!("[kiwify] page {} status={} body_len={}", page, status, body_text.len());
+        tracing::info!(
+            "[kiwify] page {} status={} body_len={}",
+            page,
+            status,
+            body_text.len()
+        );
 
         if !status.is_success() {
             if all_courses.is_empty() {
@@ -197,7 +215,13 @@ pub async fn list_courses(session: &KiwifySession) -> anyhow::Result<Vec<KiwifyC
         let total_count = body.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
         let page_size = body.get("page_size").and_then(|v| v.as_i64()).unwrap_or(10);
 
-        tracing::info!("[kiwify] page {} returned {} courses (total={}, page_size={})", page, courses_arr.len(), total_count, page_size);
+        tracing::info!(
+            "[kiwify] page {} returned {} courses (total={}, page_size={})",
+            page,
+            courses_arr.len(),
+            total_count,
+            page_size
+        );
 
         if courses_arr.is_empty() {
             break;
@@ -210,15 +234,9 @@ pub async fn list_courses(session: &KiwifySession) -> anyhow::Result<Vec<KiwifyC
                 .unwrap_or(false);
 
             let (info_obj, is_school) = if course_in_school {
-                (
-                    item.get("school_info").unwrap_or(item),
-                    true,
-                )
+                (item.get("school_info").unwrap_or(item), true)
             } else {
-                (
-                    item.get("course_info").unwrap_or(item),
-                    false,
-                )
+                (item.get("course_info").unwrap_or(item), false)
             };
 
             let id = info_obj
@@ -310,9 +328,18 @@ pub async fn get_course_content(
     course_id: &str,
 ) -> anyhow::Result<Vec<KiwifyModule>> {
     let urls = [
-        format!("https://admin-api.kiwify.com/v1/viewer/clubs/{}/content?caipirinha=true", course_id),
-        format!("https://admin-api.kiwify.com.br/v1/viewer/courses/{}", course_id),
-        format!("https://admin-api.kiwify.com.br/v1/viewer/courses/{}/sections", course_id),
+        format!(
+            "https://admin-api.kiwify.com/v1/viewer/clubs/{}/content?caipirinha=true",
+            course_id
+        ),
+        format!(
+            "https://admin-api.kiwify.com.br/v1/viewer/courses/{}",
+            course_id
+        ),
+        format!(
+            "https://admin-api.kiwify.com.br/v1/viewer/courses/{}/sections",
+            course_id
+        ),
     ];
 
     let mut body = serde_json::Value::Null;
@@ -324,7 +351,11 @@ pub async fn get_course_content(
                 body = parsed;
                 break;
             }
-            tracing::info!("[kiwify] {} returned keys: {:?}", url, parsed.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+            tracing::info!(
+                "[kiwify] {} returned keys: {:?}",
+                url,
+                parsed.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
         }
     }
 
@@ -340,9 +371,7 @@ pub async fn get_course_content(
     match modules_obj {
         serde_json::Value::Object(map) => {
             let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_by_key(|(_, v)| {
-                v.get("order").and_then(|o| o.as_i64()).unwrap_or(0)
-            });
+            entries.sort_by_key(|(_, v)| v.get("order").and_then(|o| o.as_i64()).unwrap_or(0));
 
             for (key, module_val) in entries {
                 let module_name = module_val
@@ -365,9 +394,8 @@ pub async fn get_course_content(
 
                 if let Some(serde_json::Value::Object(lessons_map)) = lessons_obj {
                     let mut lesson_entries: Vec<_> = lessons_map.iter().collect();
-                    lesson_entries.sort_by_key(|(_, v)| {
-                        v.get("order").and_then(|o| o.as_i64()).unwrap_or(0)
-                    });
+                    lesson_entries
+                        .sort_by_key(|(_, v)| v.get("order").and_then(|o| o.as_i64()).unwrap_or(0));
 
                     for (lesson_key, lesson_val) in lesson_entries {
                         let lesson_name = lesson_val
@@ -451,8 +479,9 @@ pub async fn get_course_content(
 
                 let mut lessons = Vec::new();
 
-                if let Some(serde_json::Value::Array(lessons_arr)) =
-                    module_val.get("lessons").or_else(|| module_val.get("classes"))
+                if let Some(serde_json::Value::Array(lessons_arr)) = module_val
+                    .get("lessons")
+                    .or_else(|| module_val.get("classes"))
                 {
                     for (j, lesson_val) in lessons_arr.iter().enumerate() {
                         let lesson_id = lesson_val
@@ -535,7 +564,8 @@ pub async fn get_lesson_detail(
 
     let body: serde_json::Value = serde_json::from_str(&body_text)?;
 
-    let lesson = body.get("lesson")
+    let lesson = body
+        .get("lesson")
         .or_else(|| body.get("data"))
         .unwrap_or(&body);
 
@@ -563,21 +593,40 @@ pub async fn get_lesson_detail(
     let video_url = {
         let mut url: Option<String> = None;
         if let Some(video_obj) = lesson.get("video").and_then(|v| v.as_object()) {
-            for key in &["stream_link", "stream_link_full_url", "download_link", "download_link_full_url", "url", "hls_url"] {
-                if let Some(v) = video_obj.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            for key in &[
+                "stream_link",
+                "stream_link_full_url",
+                "download_link",
+                "download_link_full_url",
+                "url",
+                "hls_url",
+            ] {
+                if let Some(v) = video_obj
+                    .get(*key)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     url = Some(v.to_string());
                     break;
                 }
             }
         }
         if url.is_none() {
-            if let Some(yt) = lesson.get("youtube_video").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(yt) = lesson
+                .get("youtube_video")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 url = Some(yt.to_string());
             }
         }
         if url.is_none() {
             for key in &["stream_link", "video_url", "media_url"] {
-                if let Some(v) = lesson.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(v) = lesson
+                    .get(*key)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     url = Some(v.to_string());
                     break;
                 }
